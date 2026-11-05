@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.5
+// @version      1.5.6
 // @description  Mufy AI-only incremental voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
@@ -14,10 +14,9 @@
   const START = '【语音开始】';
   const END = '【语音结束】';
 
-  const ACTION_SELECTOR = 'button[id="mufy_message_actions_btn"]';
+  const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
   const GROUP_SELECTOR = '.group';
   const GREETING_SELECTOR = '.greeting-content';
-  const SCROLL_SELECTOR = '.scroll-primary';
 
   let enabled = false;
   let unlocked = false;
@@ -26,11 +25,7 @@
 
   const spoken = new Set();
   const queue = [];
-
-  // 每个消息节点独立保存扫描位置
   const messageStates = new WeakMap();
-
-  // 避免重复给同一个 DOM 根节点安装监听器
   const observedRoots = new WeakSet();
 
   // ---------- UI ----------
@@ -44,7 +39,7 @@
 
   panel.innerHTML = `
     <div class="zxz-title">
-      ZXZ VOICE READER <span>1.5.5</span>
+      ZXZ VOICE READER <span>1.5.6</span>
     </div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
@@ -63,7 +58,7 @@
       z-index:2147483647;
       right:10px;
       bottom:110px;
-      width:220px;
+      width:230px;
       padding:9px;
       box-sizing:border-box;
       border:1px solid #555;
@@ -88,9 +83,9 @@
     }
 
     #zxz-status {
-      min-height:30px;
+      min-height:42px;
       padding:7px 0;
-      line-height:1.4;
+      line-height:1.5;
       color:#ddd;
       overflow-wrap:anywhere;
       font-size:10px;
@@ -168,7 +163,6 @@
     }
 
     walk(document);
-
     return roots;
   }
 
@@ -190,12 +184,10 @@
       if (observedRoots.has(root)) continue;
 
       try {
-        const observer = new MutationObserver((mutations) => {
-          const relevant = mutations.some(
-            mutation => !isPanelMutation(mutation)
-          );
-
-          if (relevant) scheduleScan();
+        const observer = new MutationObserver(mutations => {
+          if (mutations.some(m => !isPanelMutation(m))) {
+            scheduleScan();
+          }
         });
 
         observer.observe(root, {
@@ -209,12 +201,11 @@
     }
   }
 
-  // ---------- 文本提取 ----------
+  // ---------- 正文提取 ----------
 
   function getCleanText(element) {
     if (!element) return '';
 
-    // 克隆后移除不属于对白正文的区域
     const clone = element.cloneNode(true);
 
     const excluded = [
@@ -237,14 +228,11 @@
       } catch (_) {}
     }
 
-    return (clone.textContent || '')
-      .replace(/\u00a0/g, ' ');
+    return (clone.textContent || '').replace(/\u00a0/g, ' ');
   }
 
   function normalizeDialogue(text) {
-    return text
-      .replace(/\s+/g, ' ')
-      .trim();
+    return text.replace(/\s+/g, ' ').trim();
   }
 
   // ---------- 消息识别 ----------
@@ -252,6 +240,10 @@
   function findMessageRows(roots) {
     const aiRows = new Set();
     const userRows = new Set();
+    const unknownRows = new Set();
+
+    let actionButtons = 0;
+    let matchedGroups = 0;
 
     for (const root of roots) {
       let buttons = [];
@@ -262,30 +254,42 @@
         continue;
       }
 
+      actionButtons += buttons.length;
+
       for (const button of buttons) {
         const row = button.closest(GROUP_SELECTOR);
 
         if (!row) continue;
 
-        // 只处理聊天滚动区域里的消息
-        if (!row.closest(SCROLL_SELECTOR)) continue;
+        matchedGroups++;
 
-        // 用户消息：反向布局，直接排除
-        if (row.classList.contains('flex-row-reverse')) {
+        // 不再要求消息必须位于 .scroll-primary 内
+
+        const classes = row.classList;
+
+        // 用户消息：反向布局
+        if (classes.contains('flex-row-reverse')) {
           userRows.add(row);
           continue;
         }
 
         // AI 消息：正向布局
-        if (row.classList.contains('flex-row')) {
+        if (classes.contains('flex-row')) {
           aiRows.add(row);
+          continue;
         }
+
+        // 暂时无法判断的消息，留给诊断
+        unknownRows.add(row);
       }
     }
 
     return {
       aiRows: Array.from(aiRows),
-      userRows: Array.from(userRows)
+      userRows: Array.from(userRows),
+      unknownRows: Array.from(unknownRows),
+      actionButtons,
+      matchedGroups
     };
   }
 
@@ -295,11 +299,8 @@
     for (const root of roots) {
       try {
         root.querySelectorAll(GREETING_SELECTOR).forEach(el => {
-          if (el.closest(SCROLL_SELECTOR)) {
-            // 开场白独立处理，避免和普通消息重复
-            if (!el.closest(GROUP_SELECTOR)) {
-              greetings.add(el);
-            }
+          if (!el.closest(GROUP_SELECTOR)) {
+            greetings.add(el);
           }
         });
       } catch (_) {}
@@ -308,15 +309,7 @@
     return Array.from(greetings);
   }
 
-  // ---------- 完整对白与增量游标 ----------
-
-  /*
-   * 从指定位置向后提取完整对白。
-   *
-   * 没有结束标记时绝不入队。
-   * 未闭合的开始标记会保留游标，
-   * 等待后续流式字符补齐。
-   */
+  // ---------- 对白提取 ----------
 
   function extractIncremental(text, initialCursor) {
     const dialogues = [];
@@ -328,15 +321,12 @@
       const start = text.indexOf(START, cursor);
 
       if (start === -1) {
-        // 保留可能尚未完整出现的开始标记
-        const safeCursor = Math.max(
-          lastCompleteEnd,
-          text.length - START.length + 1
-        );
-
         return {
           dialogues,
-          cursor: safeCursor
+          cursor: Math.max(
+            lastCompleteEnd,
+            text.length - START.length + 1
+          )
         };
       }
 
@@ -344,8 +334,6 @@
       const end = text.indexOf(END, contentStart);
 
       if (end === -1) {
-        // 有开始标记但还没有结束标记
-        // 不越过它，等待后续追加
         return {
           dialogues,
           cursor: start
@@ -390,14 +378,6 @@
     return true;
   }
 
-  /*
-   * baseline=true：
-   * 将页面现存对白登记为历史，不播放。
-   *
-   * baseline=false：
-   * 只处理游标之后新闭合的对白。
-   */
-
   function processContainer(element, baseline) {
     const text = getCleanText(element);
 
@@ -412,20 +392,13 @@
       messageStates.set(element, state);
     }
 
-    if (state.snapshot === text) {
-      return 0;
-    }
+    if (state.snapshot === text) return 0;
 
-    let startCursor = 0;
+    const startCursor = text.startsWith(state.snapshot)
+      ? state.cursor
+      : 0;
 
-    if (text.startsWith(state.snapshot)) {
-      startCursor = state.cursor;
-    }
-
-    const result = extractIncremental(
-      text,
-      startCursor
-    );
+    const result = extractIncremental(text, startCursor);
 
     state.snapshot = text;
     state.cursor = result.cursor;
@@ -434,19 +407,16 @@
 
     for (const dialogue of result.dialogues) {
       if (baseline) {
-        // 历史内容只登记，不播放
         spoken.add(fingerprint(dialogue));
       } else if (enabled && unlocked) {
-        if (enqueue(dialogue)) {
-          added++;
-        }
+        if (enqueue(dialogue)) added++;
       }
     }
 
     return added;
   }
 
-  // ---------- 队列与语音 ----------
+  // ---------- 语音队列 ----------
 
   function pumpQueue() {
     if (!enabled || !unlocked || isSpeaking) return;
@@ -490,7 +460,7 @@
       setTimeout(pumpQueue, 150);
     };
 
-    utterance.onerror = (event) => {
+    utterance.onerror = event => {
       isSpeaking = false;
 
       if (enabled) {
@@ -511,19 +481,14 @@
 
   function scan() {
     const roots = collectRoots();
-
     observeRoots(roots);
 
-    const {
-      aiRows,
-      userRows
-    } = findMessageRows(roots);
-
+    const result = findMessageRows(roots);
     const greetings = findGreetings(roots);
 
     let added = 0;
 
-    for (const row of aiRows) {
+    for (const row of result.aiRows) {
       added += processContainer(row, false);
     }
 
@@ -533,17 +498,19 @@
 
     if (!enabled || !unlocked) {
       setStatus(
-        'AI 消息：' + aiRows.length +
-        '；用户消息：' + userRows.length +
-        '；开场白：' + greetings.length +
-        '；等待开启朗读'
+        '操作按钮：' + result.actionButtons +
+        '；消息组：' + result.matchedGroups +
+        '；AI：' + result.aiRows.length +
+        '；用户：' + result.userRows.length +
+        '；待判断：' + result.unknownRows.length +
+        '；开场白：' + greetings.length
       );
 
       return;
     }
 
     if (added > 0) {
-      setStatus('发现 AI 新对白，已加入队列 ' + added + ' 条');
+      setStatus('发现 AI 新对白，加入队列 ' + added + ' 条');
       pumpQueue();
     }
   }
@@ -553,20 +520,16 @@
     scanTimer = setTimeout(scan, 250);
   }
 
-  // ---------- 历史静默登记 ----------
+  // ---------- 历史消息登记 ----------
 
   function baselineExistingMessages() {
     const roots = collectRoots();
-
     observeRoots(roots);
 
-    const {
-      aiRows
-    } = findMessageRows(roots);
-
+    const result = findMessageRows(roots);
     const greetings = findGreetings(roots);
 
-    for (const row of aiRows) {
+    for (const row of result.aiRows) {
       processContainer(row, true);
     }
 
@@ -574,29 +537,19 @@
       processContainer(greeting, true);
     }
 
-    return {
-      aiCount: aiRows.length,
-      greetingCount: greetings.length
-    };
+    return result;
   }
 
-  // ---------- 诊断 ----------
+  // ---------- 详细诊断 ----------
 
   function diagnostic() {
     const roots = collectRoots();
-
-    observeRoots(roots);
-
-    const {
-      aiRows,
-      userRows
-    } = findMessageRows(roots);
-
+    const result = findMessageRows(roots);
     const greetings = findGreetings(roots);
 
     let dialogueCount = 0;
 
-    for (const row of aiRows) {
+    for (const row of result.aiRows) {
       dialogueCount += extractIncremental(
         getCleanText(row),
         0
@@ -610,12 +563,21 @@
       ).dialogues.length;
     }
 
+    const examples = result.unknownRows
+      .slice(0, 2)
+      .map(row => row.className || '(无 class)')
+      .join(' / ');
+
     setStatus(
-      'AI 消息：' + aiRows.length +
-      '；用户消息：' + userRows.length +
+      '操作按钮：' + result.actionButtons +
+      '；消息组：' + result.matchedGroups +
+      '；AI：' + result.aiRows.length +
+      '；用户：' + result.userRows.length +
+      '；待判断：' + result.unknownRows.length +
       '；开场白：' + greetings.length +
       '；完整对白：' + dialogueCount +
-      '；队列：' + queue.length
+      '；队列：' + queue.length +
+      (examples ? '；未知布局：' + examples : '')
     );
   }
 
@@ -627,7 +589,6 @@
       return;
     }
 
-    // 每次开启前先静默登记现存历史
     baselineExistingMessages();
 
     enabled = true;
@@ -646,18 +607,14 @@
 
     unlock.onend = () => {
       isSpeaking = false;
-
       setStatus('已开启，只监听 AI 新对白…');
-
       scheduleScan();
       setTimeout(pumpQueue, 150);
     };
 
     unlock.onerror = () => {
       isSpeaking = false;
-
       setStatus('已开启，等待角色新对白…');
-
       scheduleScan();
       setTimeout(pumpQueue, 150);
     };
@@ -697,16 +654,13 @@
       queue.length = 0;
 
       enableButton.textContent = '开启朗读';
-
       setStatus('朗读已停止');
     });
 
   // ---------- 启动 ----------
 
   const roots = collectRoots();
-
   observeRoots(roots);
-
   scheduleScan();
 
 })();
