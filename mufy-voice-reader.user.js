@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.1
-// @description  Mufy voice reader with deep DOM diagnostics
+// @version      1.5.2
+// @description  Mufy automatic dialogue voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -31,7 +31,7 @@
   const panel = document.createElement('div');
   panel.id = 'zxz-voice-panel';
   panel.innerHTML = `
-    <div class="zxz-title">ZXZ VOICE READER <span>1.5.1</span></div>
+    <div class="zxz-title">ZXZ VOICE READER <span>1.5.2</span></div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
       <button id="zxz-enable">开启朗读</button>
@@ -107,7 +107,6 @@
     }
   }
 
-  // 收集主页面、iframe、开放的 Shadow DOM
   function collectRoots() {
     const roots = [];
     const visited = new Set();
@@ -144,6 +143,7 @@
 
     for (const root of roots) {
       let elements = [];
+
       try {
         elements = root.querySelectorAll('*');
       } catch (_) {
@@ -161,16 +161,15 @@
       }
     }
 
-    // 选择包含完整标记且正文最短的元素
-    // 避免误选整个聊天页面的大容器
+    // 过滤掉内容完全相同的重复元素
     results.sort((a, b) => a.text.length - b.text.length);
 
     const chosen = [];
-    const seenTexts = new Set();
+    const seen = new Set();
 
     for (const item of results) {
-      if (seenTexts.has(item.text)) continue;
-      seenTexts.add(item.text);
+      if (seen.has(item.text)) continue;
+      seen.add(item.text);
       chosen.push(item);
     }
 
@@ -201,11 +200,20 @@
     const voice = voices.find(v =>
       v.lang && v.lang.toLowerCase().startsWith('zh')
     );
+
     if (voice) utterance.voice = voice;
 
-    utterance.onstart = () => sayStatus('正在朗读角色对白…');
-    utterance.onend = () => sayStatus('朗读完成，继续监听…');
-    utterance.onerror = e => sayStatus('播放错误：' + e.error);
+    utterance.onstart = () => {
+      sayStatus('正在朗读：' + text);
+    };
+
+    utterance.onend = () => {
+      sayStatus('朗读完成，继续监听新对白…');
+    };
+
+    utterance.onerror = e => {
+      sayStatus('播放错误：' + e.error);
+    };
 
     speechSynthesis.speak(utterance);
   }
@@ -216,21 +224,32 @@
 
     if (!matches.length) return;
 
-    for (const item of matches) {
-      const text = extract(item.text);
-      if (!text || spoken.has(text)) continue;
+    let found = false;
 
-      spoken.add(text);
+    for (const item of matches) {
+      const dialogue = extract(item.text);
+      if (!dialogue) continue;
+
+      found = true;
+
+      // 关键修复：
+      // 未开启朗读时绝不把对白记为已读。
+      if (!enabled || !unlocked) continue;
+
+      if (spoken.has(dialogue)) continue;
+
+      // 只有真正准备朗读时才记录
+      spoken.add(dialogue);
 
       if (spoken.size > 120) {
         spoken.delete(spoken.values().next().value);
       }
 
-      if (enabled && unlocked) {
-        speak(text);
-      } else {
-        sayStatus('找到语音标记！点击开启朗读');
-      }
+      speak(dialogue);
+    }
+
+    if (found && (!enabled || !unlocked)) {
+      sayStatus('已找到角色对白，点击开启朗读');
     }
   }
 
@@ -264,7 +283,6 @@
     const roots = collectRoots();
     let startFound = false;
     let endFound = false;
-    let bothFound = false;
 
     for (const root of roots) {
       let text = '';
@@ -277,7 +295,6 @@
 
       if (text.includes(START)) startFound = true;
       if (text.includes(END)) endFound = true;
-      if (hasMarkers(text)) bothFound = true;
     }
 
     const matches = findDialogues(roots);
@@ -301,8 +318,10 @@
     unlock.lang = 'zh-CN';
     speechSynthesis.speak(unlock);
 
-    sayStatus('朗读已开启，等待角色新对白…');
-    attachObservers();
+    sayStatus('朗读已开启，正在检查已有对白…');
+
+    // 立即重新扫描，补读开启前已经出现的对白
+    scheduleScan();
   });
 
   panel.querySelector('#zxz-test').addEventListener('click', () => {
@@ -325,6 +344,7 @@
     enabled = false;
     unlocked = false;
     speechSynthesis.cancel();
+
     enableButton.textContent = '开启朗读';
     sayStatus('朗读已停止');
   });
