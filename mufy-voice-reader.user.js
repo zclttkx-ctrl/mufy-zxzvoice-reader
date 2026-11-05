@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.2
+// @version      1.5.3
 // @description  Mufy automatic dialogue voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
@@ -24,14 +24,23 @@
 
   let enabled = false;
   let unlocked = false;
-  let observers = [];
   let scanTimer = null;
+  let isSpeaking = false;
+
   const spoken = new Set();
+  const queued = new Set();
+  const queue = [];
+  const observedRoots = new WeakSet();
+
+  // ---------- 面板 ----------
 
   const panel = document.createElement('div');
   panel.id = 'zxz-voice-panel';
+
   panel.innerHTML = `
-    <div class="zxz-title">ZXZ VOICE READER <span>1.5.2</span></div>
+    <div class="zxz-title">
+      ZXZ VOICE READER <span>1.5.3</span>
+    </div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
       <button id="zxz-enable">开启朗读</button>
@@ -42,41 +51,69 @@
   `;
 
   const style = document.createElement('style');
+
   style.textContent = `
     #zxz-voice-panel {
-      position:fixed; z-index:2147483647;
-      right:12px; bottom:22px; width:255px;
-      padding:13px; box-sizing:border-box;
-      border:1px solid #555; border-radius:12px;
-      background:rgba(25,25,29,.97); color:white;
-      font:12px -apple-system,BlinkMacSystemFont,sans-serif;
-      box-shadow:0 5px 22px #0005;
+      position:fixed;
+      z-index:2147483647;
+      right:10px;
+      bottom:110px;
+      width:220px;
+      padding:9px;
+      box-sizing:border-box;
+      border:1px solid #555;
+      border-radius:10px;
+      background:rgba(25,25,29,.97);
+      color:white;
+      font:11px -apple-system,BlinkMacSystemFont,sans-serif;
+      box-shadow:0 4px 16px #0005;
     }
+
     #zxz-voice-panel .zxz-title {
-      color:#f0c5ce; font-weight:bold;
-      letter-spacing:1px; font-size:11px;
+      color:#f0c5ce;
+      font-weight:bold;
+      letter-spacing:.5px;
+      font-size:10px;
     }
+
     #zxz-voice-panel .zxz-title span {
-      float:right; color:#999; font-weight:normal;
+      float:right;
+      color:#999;
+      font-weight:normal;
     }
+
     #zxz-status {
-      min-height:42px; padding:12px 0;
-      line-height:1.5; color:#ddd;
+      min-height:30px;
+      padding:7px 0;
+      line-height:1.4;
+      color:#ddd;
       overflow-wrap:anywhere;
+      font-size:10px;
     }
+
     #zxz-voice-panel .zxz-buttons {
-      display:flex; gap:5px;
+      display:flex;
+      gap:4px;
     }
+
     #zxz-voice-panel button {
-      border:0; border-radius:6px;
-      padding:9px 4px; color:white;
-      background:#713847; font-size:10px;
+      border:0;
+      border-radius:5px;
+      padding:7px 3px;
+      color:white;
+      background:#713847;
+      font-size:9px;
+      line-height:1.2;
     }
+
     #zxz-voice-panel .zxz-buttons button {
       flex:1;
+      min-width:0;
     }
+
     #zxz-stop {
-      width:100%; margin-top:6px;
+      width:100%;
+      margin-top:5px;
       background:#444 !important;
     }
   `;
@@ -90,13 +127,12 @@
     status.textContent = text;
   }
 
+  // ---------- 文本提取 ----------
+
   function getText(el) {
     return (el.innerText || el.textContent || '')
-      .replace(/\u00a0/g, ' ').trim();
-  }
-
-  function hasMarkers(text) {
-    return text.includes(START) && text.includes(END);
+      .replace(/\u00a0/g, ' ')
+      .trim();
   }
 
   function excluded(el) {
@@ -113,10 +149,12 @@
 
     function walk(root) {
       if (!root || visited.has(root)) return;
+
       visited.add(root);
       roots.push(root);
 
       let elements = [];
+
       try {
         elements = root.querySelectorAll('*');
       } catch (_) {
@@ -124,11 +162,15 @@
       }
 
       for (const el of elements) {
-        if (el.shadowRoot) walk(el.shadowRoot);
+        if (el.shadowRoot) {
+          walk(el.shadowRoot);
+        }
 
         if (el.tagName === 'IFRAME') {
           try {
-            if (el.contentDocument) walk(el.contentDocument);
+            if (el.contentDocument) {
+              walk(el.contentDocument);
+            }
           } catch (_) {}
         }
       }
@@ -137,6 +179,28 @@
     walk(document);
     return roots;
   }
+
+  // ---------- 监听新区域 ----------
+
+  function observeRoots(roots) {
+    for (const root of roots) {
+      if (observedRoots.has(root)) continue;
+
+      try {
+        const observer = new MutationObserver(scheduleScan);
+
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          characterData: true
+        });
+
+        observedRoots.add(root);
+      } catch (_) {}
+    }
+  }
+
+  // ---------- 查找对白 ----------
 
   function findDialogues(roots) {
     const results = [];
@@ -155,13 +219,20 @@
         if (excluded(el)) continue;
 
         const text = getText(el);
-        if (!text || !hasMarkers(text)) continue;
+
+        if (
+          !text ||
+          !text.includes(START) ||
+          !text.includes(END)
+        ) {
+          continue;
+        }
 
         results.push({ element: el, text });
       }
     }
 
-    // 过滤掉内容完全相同的重复元素
+    // 优先保留内容较短的节点，避免父子节点重复
     results.sort((a, b) => a.text.length - b.text.length);
 
     const chosen = [];
@@ -169,6 +240,7 @@
 
     for (const item of results) {
       if (seen.has(item.text)) continue;
+
       seen.add(item.text);
       chosen.push(item);
     }
@@ -176,111 +248,158 @@
     return chosen;
   }
 
-  function extract(text) {
-    const start = text.indexOf(START);
-    if (start < 0) return '';
+  // 重要修复：一次提取所有完整对白，而不只是第一条
+  function extractAll(text) {
+    const dialogues = [];
+    let cursor = 0;
 
-    const from = start + START.length;
-    const end = text.indexOf(END, from);
+    while (cursor < text.length) {
+      const start = text.indexOf(START, cursor);
 
-    if (end < 0) return '';
+      if (start < 0) break;
 
-    return text.slice(from, end).replace(/\s+/g, ' ').trim();
+      const from = start + START.length;
+      const end = text.indexOf(END, from);
+
+      if (end < 0) break;
+
+      const dialogue = text
+        .slice(from, end)
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (dialogue) {
+        dialogues.push(dialogue);
+      }
+
+      cursor = end + END.length;
+    }
+
+    return dialogues;
   }
 
-  function speak(text) {
-    if (!enabled || !unlocked || !text) return;
+  // ---------- 语音队列 ----------
+
+  function enqueue(text) {
+    if (!text) return;
+
+    if (spoken.has(text) || queued.has(text)) {
+      return;
+    }
+
+    queued.add(text);
+    queue.push(text);
+  }
+
+  function finishCurrent() {
+    isSpeaking = false;
+
+    if (!enabled || !unlocked) return;
+
+    if (queue.length) {
+      sayStatus('当前对白完成，队列剩余 ' + queue.length + ' 条…');
+      setTimeout(pumpQueue, 120);
+    } else {
+      sayStatus('朗读完成，继续监听新对白…');
+    }
+  }
+
+  function pumpQueue() {
+    if (!enabled || !unlocked) return;
+    if (isSpeaking) return;
+    if (!queue.length) return;
+
+    const text = queue.shift();
+
+    queued.delete(text);
+    spoken.add(text);
+    isSpeaking = true;
 
     const utterance = new SpeechSynthesisUtterance(text);
+
     utterance.lang = 'zh-CN';
     utterance.rate = 1;
     utterance.pitch = 1;
 
-    const voices = speechSynthesis.getVoices();
-    const voice = voices.find(v =>
-      v.lang && v.lang.toLowerCase().startsWith('zh')
-    );
+    try {
+      const voices = speechSynthesis.getVoices();
 
-    if (voice) utterance.voice = voice;
+      const voice = voices.find(v =>
+        v.lang && v.lang.toLowerCase().startsWith('zh')
+      );
+
+      if (voice) utterance.voice = voice;
+    } catch (_) {}
 
     utterance.onstart = () => {
       sayStatus('正在朗读：' + text);
     };
 
-    utterance.onend = () => {
-      sayStatus('朗读完成，继续监听新对白…');
-    };
+    utterance.onend = finishCurrent;
+    utterance.onerror = finishCurrent;
 
-    utterance.onerror = e => {
-      sayStatus('播放错误：' + e.error);
-    };
-
-    speechSynthesis.speak(utterance);
+    try {
+      speechSynthesis.speak(utterance);
+    } catch (error) {
+      finishCurrent();
+    }
   }
+
+  // ---------- 页面扫描 ----------
 
   function scan() {
     const roots = collectRoots();
+
+    // 新出现的 Shadow DOM 也加入监听
+    observeRoots(roots);
+
     const matches = findDialogues(roots);
 
     if (!matches.length) return;
 
     let found = false;
+    let added = 0;
 
     for (const item of matches) {
-      const dialogue = extract(item.text);
-      if (!dialogue) continue;
+      const dialogues = extractAll(item.text);
 
-      found = true;
+      for (const dialogue of dialogues) {
+        found = true;
 
-      // 关键修复：
-      // 未开启朗读时绝不把对白记为已读。
-      if (!enabled || !unlocked) continue;
+        if (!enabled || !unlocked) continue;
 
-      if (spoken.has(dialogue)) continue;
+        const wasKnown =
+          spoken.has(dialogue) || queued.has(dialogue);
 
-      // 只有真正准备朗读时才记录
-      spoken.add(dialogue);
+        enqueue(dialogue);
 
-      if (spoken.size > 120) {
-        spoken.delete(spoken.values().next().value);
+        if (!wasKnown) added++;
       }
-
-      speak(dialogue);
     }
 
     if (found && (!enabled || !unlocked)) {
       sayStatus('已找到角色对白，点击开启朗读');
+      return;
+    }
+
+    if (added > 0) {
+      sayStatus('已加入朗读队列：' + added + ' 条');
+      pumpQueue();
     }
   }
 
   function scheduleScan() {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 400);
+    scanTimer = setTimeout(scan, 350);
   }
 
-  function attachObservers() {
-    for (const observer of observers) observer.disconnect();
-    observers = [];
-
-    const roots = collectRoots();
-
-    for (const root of roots) {
-      try {
-        const observer = new MutationObserver(scheduleScan);
-        observer.observe(root, {
-          childList: true,
-          subtree: true,
-          characterData: true
-        });
-        observers.push(observer);
-      } catch (_) {}
-    }
-
-    scheduleScan();
-  }
+  // ---------- 诊断 ----------
 
   function diagnostic() {
     const roots = collectRoots();
+
+    observeRoots(roots);
+
     let startFound = false;
     let endFound = false;
 
@@ -299,55 +418,95 @@
 
     const matches = findDialogues(roots);
 
+    let dialogueCount = 0;
+
+    for (const item of matches) {
+      dialogueCount += extractAll(item.text).length;
+    }
+
     sayStatus(
-      '检查结果：区域 ' + roots.length +
-      ' 个；开始标记 ' + (startFound ? '有' : '无') +
+      '区域 ' + roots.length +
+      '；开始标记 ' + (startFound ? '有' : '无') +
       '；结束标记 ' + (endFound ? '有' : '无') +
-      '；完整正文元素 ' + matches.length
+      '；正文元素 ' + matches.length +
+      '；对白组数 ' + dialogueCount +
+      '；队列 ' + queue.length
     );
   }
+
+  // ---------- 按钮 ----------
 
   enableButton.addEventListener('click', () => {
     enabled = true;
     unlocked = true;
+
     enableButton.textContent = '朗读已开启';
 
     speechSynthesis.cancel();
+    isSpeaking = true;
 
-    const unlock = new SpeechSynthesisUtterance('语音朗读已开启');
+    const unlock = new SpeechSynthesisUtterance(
+      '语音朗读已开启'
+    );
+
     unlock.lang = 'zh-CN';
+
+    unlock.onend = () => {
+      isSpeaking = false;
+      sayStatus('朗读已开启，正在监听新对白…');
+      scheduleScan();
+      setTimeout(pumpQueue, 120);
+    };
+
+    unlock.onerror = () => {
+      isSpeaking = false;
+      scheduleScan();
+      setTimeout(pumpQueue, 120);
+    };
+
     speechSynthesis.speak(unlock);
 
-    sayStatus('朗读已开启，正在检查已有对白…');
-
-    // 立即重新扫描，补读开启前已经出现的对白
     scheduleScan();
   });
 
-  panel.querySelector('#zxz-test').addEventListener('click', () => {
-    enabled = true;
-    unlocked = true;
-    enableButton.textContent = '朗读已开启';
+  panel.querySelector('#zxz-test')
+    .addEventListener('click', () => {
+      if (!enabled) {
+        enabled = true;
+        unlocked = true;
+        enableButton.textContent = '朗读已开启';
+      }
 
-    speechSynthesis.cancel();
+      enqueue('听见了吗？过来。');
 
-    const test = new SpeechSynthesisUtterance('听见了吗？过来。');
-    test.lang = 'zh-CN';
-    speechSynthesis.speak(test);
+      sayStatus('试听已加入队列…');
+      pumpQueue();
+    });
 
-    sayStatus('正在试听…');
-  });
+  panel.querySelector('#zxz-check')
+    .addEventListener('click', diagnostic);
 
-  panel.querySelector('#zxz-check').addEventListener('click', diagnostic);
+  panel.querySelector('#zxz-stop')
+    .addEventListener('click', () => {
+      enabled = false;
+      unlocked = false;
 
-  panel.querySelector('#zxz-stop').addEventListener('click', () => {
-    enabled = false;
-    unlocked = false;
-    speechSynthesis.cancel();
+      speechSynthesis.cancel();
 
-    enableButton.textContent = '开启朗读';
-    sayStatus('朗读已停止');
-  });
+      isSpeaking = false;
+      queue.length = 0;
+      queued.clear();
 
-  attachObservers();
+      enableButton.textContent = '开启朗读';
+
+      sayStatus('朗读已停止');
+    });
+
+  // ---------- 启动 ----------
+
+  const initialRoots = collectRoots();
+
+  observeRoots(initialRoots);
+  scheduleScan();
+
 })();
