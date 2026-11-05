@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.7
+// @version      1.5.8
 // @description  Mufy message structure diagnostic
 // @match        https://chat.mufy.ai/*
 // @grant        none
@@ -12,6 +12,7 @@
   'use strict';
 
   const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
+  const ROW_SELECTOR = 'div.relative.flex.w-full.pb-4';
 
   const oldPanel = document.getElementById('zxz-voice-panel');
   if (oldPanel) oldPanel.remove();
@@ -21,13 +22,13 @@
 
   panel.innerHTML = `
     <div style="font-weight:bold;color:#f0c5ce;margin-bottom:7px">
-      ZXZ VOICE READER 1.5.7
+      ZXZ VOICE READER 1.5.8
     </div>
-    <div id="zxz-status" style="font-size:11px;line-height:1.6;overflow-wrap:anywhere">
+    <div id="zxz-status" style="font-size:11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;max-height:35vh;overflow:auto">
       正在检查页面…
     </div>
     <button id="zxz-check" style="margin-top:8px;padding:7px;background:#713847;color:white;border:0;border-radius:5px">
-      检查页面
+      重新检查
     </button>
   `;
 
@@ -36,8 +37,8 @@
     zIndex: '2147483647',
     right: '10px',
     bottom: '110px',
-    width: '270px',
-    maxHeight: '45vh',
+    width: '290px',
+    maxHeight: '55vh',
     overflow: 'auto',
     padding: '10px',
     boxSizing: 'border-box',
@@ -53,108 +54,87 @@
 
   const status = panel.querySelector('#zxz-status');
 
-  function collectRoots() {
-    const roots = [];
-    const visited = new Set();
+  function diagnostic() {
+    const buttons = document.querySelectorAll(ACTION_SELECTOR);
+    const lines = [];
 
-    function walk(root) {
-      if (!root || visited.has(root)) return;
+    lines.push('操作按钮：' + buttons.length);
+    lines.push('');
 
-      visited.add(root);
-      roots.push(root);
+    buttons.forEach((button, index) => {
+      const row = button.closest(ROW_SELECTOR);
 
-      let elements = [];
+      lines.push('===== 消息 ' + (index + 1) + ' =====');
 
-      try {
-        elements = root.querySelectorAll('*');
-      } catch (_) {
+      if (!row) {
+        lines.push('没有找到第4层消息容器');
         return;
       }
 
-      for (const el of elements) {
-        if (el.shadowRoot) walk(el.shadowRoot);
+      lines.push('根节点：' + row.tagName.toLowerCase());
+      lines.push('根节点 class：' + row.className);
 
-        if (el.tagName === 'IFRAME') {
-          try {
-            if (el.contentDocument) walk(el.contentDocument);
-          } catch (_) {}
+      const text = (row.innerText || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      lines.push('消息文本：' + (text.slice(0, 220) || '(空)'));
+
+      const descendants = row.querySelectorAll('*');
+
+      const layoutClasses = [];
+
+      descendants.forEach(el => {
+        if (
+          el.classList.contains('flex-row') ||
+          el.classList.contains('flex-row-reverse')
+        ) {
+          layoutClasses.push(el.tagName.toLowerCase() + '.' + el.className);
         }
-      }
-    }
+      });
 
-    walk(document);
-    return roots;
-  }
+      lines.push(
+        '方向布局：' +
+        (layoutClasses.slice(0, 5).join(' | ') || '未发现')
+      );
 
-  function describeNode(node, level) {
-    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
-      return level + '层：非元素节点';
-    }
+      const images = row.querySelectorAll('img');
 
-    const tag = node.tagName.toLowerCase();
+      images.forEach((img, i) => {
+        lines.push(
+          '图片' + (i + 1) +
+          ' alt=' + (img.alt || '(无)') +
+          ' src=' + (img.getAttribute('src') || '(无)').slice(0, 100)
+        );
+      });
 
-    let cls = '';
+      const prose = row.querySelectorAll('.prose');
 
-    if (typeof node.className === 'string') {
-      cls = node.className;
-    } else if (node.className && node.className.baseVal) {
-      cls = node.className.baseVal;
-    }
+      prose.forEach((el, i) => {
+        lines.push(
+          '正文' + (i + 1) +
+          ' class=' + el.className +
+          ' text=' + (el.innerText || '').slice(0, 150)
+        );
+      });
 
-    cls = cls.trim().replace(/\s+/g, ' ');
+      lines.push('子元素结构：');
 
-    if (cls.length > 115) {
-      cls = cls.slice(0, 115) + '…';
-    }
+      Array.from(row.children).forEach((child, i) => {
+        lines.push(
+          '子元素' + i + '：' +
+          child.tagName.toLowerCase() +
+          ' .' +
+          (typeof child.className === 'string'
+            ? child.className.replace(/\s+/g, '.')
+            : '')
+        );
+      });
 
-    const id = node.id ? '#' + node.id : '';
-    const classText = cls
-      ? ' .' + cls.replace(/ /g, '.')
-      : '';
+      lines.push('');
+    });
 
-    return level + '层：' + tag + id + classText;
-  }
-
-  function diagnostic() {
-    const roots = collectRoots();
-
-    const lines = [];
-    let buttonCount = 0;
-
-    for (const root of roots) {
-      let buttons = [];
-
-      try {
-        buttons = root.querySelectorAll(ACTION_SELECTOR);
-      } catch (_) {
-        continue;
-      }
-
-      for (const button of buttons) {
-        buttonCount++;
-
-        lines.push('按钮 ' + buttonCount);
-
-        let node = button;
-
-        for (let level = 0; level < 9 && node; level++) {
-          lines.push(describeNode(node, level));
-          node = node.parentElement;
-        }
-
-        lines.push('----------');
-      }
-    }
-
-    if (!buttonCount) {
-      status.textContent = '没有找到操作按钮。';
-      return;
-    }
-
-    status.textContent =
-      '找到操作按钮：' + buttonCount +
-      '。以下是每个按钮向上的九层结构：\n\n' +
-      lines.join('\n');
+    status.textContent = lines.join('\n');
   }
 
   panel.querySelector('#zxz-check')
