@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.0
-// @description  Automatically read Mufy AI dialogue wrapped in voice markers
+// @version      1.5.1
+// @description  Mufy voice reader with deep DOM diagnostics
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -12,345 +12,323 @@
 (function () {
   'use strict';
 
-  const START_MARK = '【语音开始】';
-  const END_MARK = '【语音结束】';
+  const START = '【语音开始】';
+  const END = '【语音结束】';
 
-  const EXCLUDE_SELECTOR = [
+  const EXCLUDE = [
     '.mufy_user_message_bubble',
     '[class*="message-incoming"]',
     '.mufy_message_narration',
-    'script',
-    'style',
-    'textarea',
-    'input',
+    'script', 'style', 'textarea', 'input',
     '[contenteditable="true"]'
   ].join(',');
 
   let enabled = false;
-  let observer = null;
-  let voiceUnlocked = false;
-
-  const spokenTexts = new Set();
+  let unlocked = false;
+  let observers = [];
+  let scanTimer = null;
+  const spoken = new Set();
 
   const panel = document.createElement('div');
-  panel.id = 'zxz-voice-reader-panel';
-
+  panel.id = 'zxz-voice-panel';
   panel.innerHTML = `
-    <div id="zxz-vr-title">ZXZ VOICE READER <span>1.5.0</span></div>
-    <div id="zxz-vr-status">正在寻找语音标记…</div>
-    <div id="zxz-vr-buttons">
-      <button id="zxz-vr-enable">开启朗读</button>
-      <button id="zxz-vr-test">试听</button>
-      <button id="zxz-vr-stop">停止</button>
+    <div class="zxz-title">ZXZ VOICE READER <span>1.5.1</span></div>
+    <div id="zxz-status">正在启动监听…</div>
+    <div class="zxz-buttons">
+      <button id="zxz-enable">开启朗读</button>
+      <button id="zxz-test">试听</button>
+      <button id="zxz-check">检查页面</button>
     </div>
-    <div id="zxz-vr-footer">自动识别角色对白 · 旁白不朗读</div>
+    <button id="zxz-stop">停止朗读</button>
   `;
 
-  const css = document.createElement('style');
-  css.textContent = `
-    #zxz-voice-reader-panel {
-      position: fixed;
-      z-index: 2147483647;
-      right: 12px;
-      bottom: 22px;
-      width: 245px;
-      padding: 13px;
-      box-sizing: border-box;
-      border: 1px solid rgba(255,255,255,.18);
-      border-radius: 13px;
-      background: rgba(25,25,29,.96);
-      color: #fff;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      box-shadow: 0 5px 22px rgba(0,0,0,.28);
-      font-size: 12px;
+  const style = document.createElement('style');
+  style.textContent = `
+    #zxz-voice-panel {
+      position:fixed; z-index:2147483647;
+      right:12px; bottom:22px; width:255px;
+      padding:13px; box-sizing:border-box;
+      border:1px solid #555; border-radius:12px;
+      background:rgba(25,25,29,.97); color:white;
+      font:12px -apple-system,BlinkMacSystemFont,sans-serif;
+      box-shadow:0 5px 22px #0005;
     }
-
-    #zxz-vr-title {
-      font-size: 11px;
-      letter-spacing: 1px;
-      font-weight: 700;
-      color: #f0c5ce;
+    #zxz-voice-panel .zxz-title {
+      color:#f0c5ce; font-weight:bold;
+      letter-spacing:1px; font-size:11px;
     }
-
-    #zxz-vr-title span {
-      float: right;
-      color: #999;
-      font-weight: 400;
+    #zxz-voice-panel .zxz-title span {
+      float:right; color:#999; font-weight:normal;
     }
-
-    #zxz-vr-status {
-      min-height: 32px;
-      padding: 12px 0 8px;
-      color: #ddd;
-      line-height: 1.5;
-      overflow-wrap: anywhere;
+    #zxz-status {
+      min-height:42px; padding:12px 0;
+      line-height:1.5; color:#ddd;
+      overflow-wrap:anywhere;
     }
-
-    #zxz-vr-buttons {
-      display: flex;
-      gap: 6px;
+    #zxz-voice-panel .zxz-buttons {
+      display:flex; gap:5px;
     }
-
-    #zxz-vr-buttons button {
-      flex: 1;
-      border: 0;
-      border-radius: 7px;
-      padding: 9px 3px;
-      background: #713847;
-      color: white;
-      font-size: 11px;
-      font-weight: 600;
+    #zxz-voice-panel button {
+      border:0; border-radius:6px;
+      padding:9px 4px; color:white;
+      background:#713847; font-size:10px;
     }
-
-    #zxz-vr-buttons button:active {
-      opacity: .7;
+    #zxz-voice-panel .zxz-buttons button {
+      flex:1;
     }
-
-    #zxz-vr-footer {
-      padding-top: 9px;
-      color: #888;
-      font-size: 10px;
-      text-align: center;
+    #zxz-stop {
+      width:100%; margin-top:6px;
+      background:#444 !important;
     }
   `;
 
-  document.documentElement.appendChild(css);
-  document.documentElement.appendChild(panel);
+  document.documentElement.append(style, panel);
 
-  const status = panel.querySelector('#zxz-vr-status');
-  const enableButton = panel.querySelector('#zxz-vr-enable');
+  const status = panel.querySelector('#zxz-status');
+  const enableButton = panel.querySelector('#zxz-enable');
 
-  function setStatus(message) {
-    status.textContent = message;
+  function sayStatus(text) {
+    status.textContent = text;
   }
 
-  function getText(element) {
-    return (element.innerText || element.textContent || '')
-      .replace(/\u00a0/g, ' ')
-      .trim();
+  function getText(el) {
+    return (el.innerText || el.textContent || '')
+      .replace(/\u00a0/g, ' ').trim();
   }
 
-  function containsMarkers(text) {
-    return text.includes(START_MARK) && text.includes(END_MARK);
+  function hasMarkers(text) {
+    return text.includes(START) && text.includes(END);
   }
 
-  function isExcluded(element) {
+  function excluded(el) {
     try {
-      return !!element.closest(EXCLUDE_SELECTOR);
-    } catch (error) {
+      return !!el.closest(EXCLUDE);
+    } catch (_) {
       return false;
     }
   }
 
-  // 找到包含完整语音标记的最小正文元素
-  function findDialogueElements() {
-    const all = document.body.querySelectorAll('*');
-    const candidates = [];
+  // 收集主页面、iframe、开放的 Shadow DOM
+  function collectRoots() {
+    const roots = [];
+    const visited = new Set();
 
-    for (const element of all) {
-      if (panel.contains(element)) continue;
-      if (isExcluded(element)) continue;
+    function walk(root) {
+      if (!root || visited.has(root)) return;
+      visited.add(root);
+      roots.push(root);
 
-      const text = getText(element);
+      let elements = [];
+      try {
+        elements = root.querySelectorAll('*');
+      } catch (_) {
+        return;
+      }
 
-      if (!text || !containsMarkers(text)) continue;
+      for (const el of elements) {
+        if (el.shadowRoot) walk(el.shadowRoot);
 
-      candidates.push({
-        element,
-        text
-      });
-    }
-
-    // 优先选最内层：如果子元素已经包含完整标记，
-    // 就不再选择它的父级容器。
-    const leaves = candidates.filter(item => {
-      for (const child of item.element.children) {
-        if (containsMarkers(getText(child))) {
-          return false;
+        if (el.tagName === 'IFRAME') {
+          try {
+            if (el.contentDocument) walk(el.contentDocument);
+          } catch (_) {}
         }
       }
-      return true;
-    });
+    }
 
-    return leaves.length ? leaves : candidates;
+    walk(document);
+    return roots;
   }
 
-  function extractDialogue(text) {
-    const start = text.indexOf(START_MARK);
+  function findDialogues(roots) {
+    const results = [];
+
+    for (const root of roots) {
+      let elements = [];
+      try {
+        elements = root.querySelectorAll('*');
+      } catch (_) {
+        continue;
+      }
+
+      for (const el of elements) {
+        if (panel.contains(el)) continue;
+        if (excluded(el)) continue;
+
+        const text = getText(el);
+        if (!text || !hasMarkers(text)) continue;
+
+        results.push({ element: el, text });
+      }
+    }
+
+    // 选择包含完整标记且正文最短的元素
+    // 避免误选整个聊天页面的大容器
+    results.sort((a, b) => a.text.length - b.text.length);
+
+    const chosen = [];
+    const seenTexts = new Set();
+
+    for (const item of results) {
+      if (seenTexts.has(item.text)) continue;
+      seenTexts.add(item.text);
+      chosen.push(item);
+    }
+
+    return chosen;
+  }
+
+  function extract(text) {
+    const start = text.indexOf(START);
     if (start < 0) return '';
 
-    const contentStart = start + START_MARK.length;
-    const end = text.indexOf(END_MARK, contentStart);
+    const from = start + START.length;
+    const end = text.indexOf(END, from);
 
     if (end < 0) return '';
 
-    return text
-      .slice(contentStart, end)
-      .replace(/\s+/g, ' ')
-      .trim();
+    return text.slice(from, end).replace(/\s+/g, ' ').trim();
   }
 
   function speak(text) {
-    if (!enabled || !voiceUnlocked || !text) return;
-
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音朗读');
-      return;
-    }
+    if (!enabled || !unlocked || !text) return;
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'zh-CN';
     utterance.rate = 1;
     utterance.pitch = 1;
 
-    const voices = window.speechSynthesis.getVoices();
-    const chineseVoice = voices.find(voice =>
-      voice.lang && voice.lang.toLowerCase().startsWith('zh')
+    const voices = speechSynthesis.getVoices();
+    const voice = voices.find(v =>
+      v.lang && v.lang.toLowerCase().startsWith('zh')
     );
+    if (voice) utterance.voice = voice;
 
-    if (chineseVoice) {
-      utterance.voice = chineseVoice;
-    }
+    utterance.onstart = () => sayStatus('正在朗读角色对白…');
+    utterance.onend = () => sayStatus('朗读完成，继续监听…');
+    utterance.onerror = e => sayStatus('播放错误：' + e.error);
 
-    utterance.onstart = () => {
-      setStatus('正在朗读角色对白…');
-    };
-
-    utterance.onend = () => {
-      setStatus('朗读完成，继续监听新对白');
-    };
-
-    utterance.onerror = event => {
-      setStatus('语音播放遇到问题：' + event.error);
-    };
-
-    window.speechSynthesis.speak(utterance);
+    speechSynthesis.speak(utterance);
   }
 
-  function scanPage() {
-    if (!document.body) return;
+  function scan() {
+    const roots = collectRoots();
+    const matches = findDialogues(roots);
 
-    const candidates = findDialogueElements();
+    if (!matches.length) return;
 
-    if (!candidates.length) {
-      return;
-    }
+    for (const item of matches) {
+      const text = extract(item.text);
+      if (!text || spoken.has(text)) continue;
 
-    let foundNew = false;
+      spoken.add(text);
 
-    for (const item of candidates) {
-      const dialogue = extractDialogue(item.text);
-      if (!dialogue) continue;
-
-      // 同一段对白只朗读一次
-      if (spokenTexts.has(dialogue)) continue;
-
-      spokenTexts.add(dialogue);
-
-      // 控制缓存大小
-      if (spokenTexts.size > 120) {
-        const first = spokenTexts.values().next().value;
-        spokenTexts.delete(first);
+      if (spoken.size > 120) {
+        spoken.delete(spoken.values().next().value);
       }
 
-      foundNew = true;
-
-      if (enabled && voiceUnlocked) {
-        speak(dialogue);
+      if (enabled && unlocked) {
+        speak(text);
+      } else {
+        sayStatus('找到语音标记！点击开启朗读');
       }
-    }
-
-    if (foundNew && !enabled) {
-      setStatus('已发现角色语音对白，点击开启朗读');
     }
   }
-
-  let scanTimer = null;
 
   function scheduleScan() {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(scanPage, 350);
+    scanTimer = setTimeout(scan, 400);
   }
 
-  function startObserver() {
-    if (observer || !document.body) return;
+  function attachObservers() {
+    for (const observer of observers) observer.disconnect();
+    observers = [];
 
-    observer = new MutationObserver(() => {
-      scheduleScan();
-    });
+    const roots = collectRoots();
 
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
+    for (const root of roots) {
+      try {
+        const observer = new MutationObserver(scheduleScan);
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          characterData: true
+        });
+        observers.push(observer);
+      } catch (_) {}
+    }
 
-    setStatus('监听中，等待角色发送对白…');
+    scheduleScan();
+  }
+
+  function diagnostic() {
+    const roots = collectRoots();
+    let startFound = false;
+    let endFound = false;
+    let bothFound = false;
+
+    for (const root of roots) {
+      let text = '';
+
+      try {
+        text = root.body
+          ? getText(root.body)
+          : getText(root.host || document.body);
+      } catch (_) {}
+
+      if (text.includes(START)) startFound = true;
+      if (text.includes(END)) endFound = true;
+      if (hasMarkers(text)) bothFound = true;
+    }
+
+    const matches = findDialogues(roots);
+
+    sayStatus(
+      '检查结果：区域 ' + roots.length +
+      ' 个；开始标记 ' + (startFound ? '有' : '无') +
+      '；结束标记 ' + (endFound ? '有' : '无') +
+      '；完整正文元素 ' + matches.length
+    );
   }
 
   enableButton.addEventListener('click', () => {
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音朗读');
-      return;
-    }
-
     enabled = true;
-    voiceUnlocked = true;
-
+    unlocked = true;
     enableButton.textContent = '朗读已开启';
-    setStatus('朗读已开启，等待角色新对白…');
 
-    // 用户主动点击，解锁浏览器语音播放
+    speechSynthesis.cancel();
+
     const unlock = new SpeechSynthesisUtterance('语音朗读已开启');
     unlock.lang = 'zh-CN';
-    unlock.rate = 1;
+    speechSynthesis.speak(unlock);
 
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(unlock);
+    sayStatus('朗读已开启，等待角色新对白…');
+    attachObservers();
   });
 
-  panel.querySelector('#zxz-vr-test').addEventListener('click', () => {
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音朗读');
-      return;
-    }
-
+  panel.querySelector('#zxz-test').addEventListener('click', () => {
     enabled = true;
-    voiceUnlocked = true;
+    unlocked = true;
     enableButton.textContent = '朗读已开启';
 
-    window.speechSynthesis.cancel();
+    speechSynthesis.cancel();
 
     const test = new SpeechSynthesisUtterance('听见了吗？过来。');
     test.lang = 'zh-CN';
-    test.rate = 1;
-    test.pitch = 1;
+    speechSynthesis.speak(test);
 
-    window.speechSynthesis.speak(test);
-    setStatus('正在试听…');
+    sayStatus('正在试听…');
   });
 
-  panel.querySelector('#zxz-vr-stop').addEventListener('click', () => {
+  panel.querySelector('#zxz-check').addEventListener('click', diagnostic);
+
+  panel.querySelector('#zxz-stop').addEventListener('click', () => {
     enabled = false;
-    voiceUnlocked = false;
-
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-
+    unlocked = false;
+    speechSynthesis.cancel();
     enableButton.textContent = '开启朗读';
-    setStatus('朗读已停止');
+    sayStatus('朗读已停止');
   });
 
-  function initialize() {
-    startObserver();
-    scanPage();
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initialize);
-  } else {
-    initialize();
-  }
-
+  attachObservers();
 })();
