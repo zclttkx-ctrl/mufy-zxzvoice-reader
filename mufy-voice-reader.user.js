@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.8
-// @description  Mufy message structure diagnostic
+// @version      1.5.9
+// @description  Mufy message ancestor diagnostic
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -12,7 +12,6 @@
   'use strict';
 
   const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
-  const ROW_SELECTOR = 'div.relative.flex.w-full.pb-4';
 
   const oldPanel = document.getElementById('zxz-voice-panel');
   if (oldPanel) oldPanel.remove();
@@ -22,14 +21,24 @@
 
   panel.innerHTML = `
     <div style="font-weight:bold;color:#f0c5ce;margin-bottom:7px">
-      ZXZ VOICE READER 1.5.8
+      ZXZ VOICE READER 1.5.9
     </div>
-    <div id="zxz-status" style="font-size:11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;max-height:35vh;overflow:auto">
-      正在检查页面…
-    </div>
-    <button id="zxz-check" style="margin-top:8px;padding:7px;background:#713847;color:white;border:0;border-radius:5px">
-      重新检查
-    </button>
+    <div id="zxz-status" style="
+      font-size:11px;
+      line-height:1.6;
+      white-space:pre-wrap;
+      overflow-wrap:anywhere;
+      max-height:40vh;
+      overflow:auto
+    ">正在检查页面…</div>
+    <button id="zxz-check" style="
+      margin-top:8px;
+      padding:7px;
+      background:#713847;
+      color:white;
+      border:0;
+      border-radius:5px
+    ">重新检查</button>
   `;
 
   Object.assign(panel.style, {
@@ -38,7 +47,7 @@
     right: '10px',
     bottom: '110px',
     width: '290px',
-    maxHeight: '55vh',
+    maxHeight: '60vh',
     overflow: 'auto',
     padding: '10px',
     boxSizing: 'border-box',
@@ -54,6 +63,16 @@
 
   const status = panel.querySelector('#zxz-status');
 
+  function shortClass(el) {
+    if (!el) return '';
+
+    let value = typeof el.className === 'string'
+      ? el.className
+      : '';
+
+    return value.replace(/\s+/g, '.').slice(0, 180);
+  }
+
   function diagnostic() {
     const buttons = document.querySelectorAll(ACTION_SELECTOR);
     const lines = [];
@@ -62,74 +81,71 @@
     lines.push('');
 
     buttons.forEach((button, index) => {
-      const row = button.closest(ROW_SELECTOR);
+      lines.push('========== 按钮 ' + (index + 1) + ' ==========');
 
-      lines.push('===== 消息 ' + (index + 1) + ' =====');
+      let node = button;
 
-      if (!row) {
-        lines.push('没有找到第4层消息容器');
-        return;
-      }
+      for (let level = 0; level <= 7 && node; level++) {
+        const tag = node.tagName.toLowerCase();
 
-      lines.push('根节点：' + row.tagName.toLowerCase());
-      lines.push('根节点 class：' + row.className);
+        lines.push('');
+        lines.push('--- 向上第 ' + level + ' 层 ---');
+        lines.push('标签：' + tag);
+        lines.push('class：' + shortClass(node));
 
-      const text = (row.innerText || '')
-        .replace(/\s+/g, ' ')
-        .trim();
+        const text = (node.innerText || node.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
 
-      lines.push('消息文本：' + (text.slice(0, 220) || '(空)'));
+        lines.push('文本：' + (text.slice(0, 180) || '(空)'));
 
-      const descendants = row.querySelectorAll('*');
+        const children = Array.from(node.children || []);
 
-      const layoutClasses = [];
+        lines.push('直接子元素数量：' + children.length);
 
-      descendants.forEach(el => {
-        if (
-          el.classList.contains('flex-row') ||
-          el.classList.contains('flex-row-reverse')
-        ) {
-          layoutClasses.push(el.tagName.toLowerCase() + '.' + el.className);
+        children.slice(0, 6).forEach((child, i) => {
+          const childText = (
+            child.innerText ||
+            child.textContent ||
+            ''
+          ).replace(/\s+/g, ' ').trim();
+
+          lines.push(
+            '子元素' + i +
+            '：' + child.tagName.toLowerCase() +
+            ' .' + shortClass(child) +
+            ' 文本=' + (childText.slice(0, 90) || '(空)')
+          );
+        });
+
+        const images = node.querySelectorAll('img');
+
+        if (images.length) {
+          Array.from(images).slice(0, 3).forEach((img, i) => {
+            lines.push(
+              '图片' + i +
+              '：alt=' + (img.alt || '(无)') +
+              '；src=' + (img.getAttribute('src') || '(无)').slice(0, 100)
+            );
+          });
         }
-      });
 
-      lines.push(
-        '方向布局：' +
-        (layoutClasses.slice(0, 5).join(' | ') || '未发现')
-      );
+        const prose = node.querySelectorAll('.prose');
 
-      const images = row.querySelectorAll('img');
+        if (prose.length) {
+          Array.from(prose).slice(0, 3).forEach((el, i) => {
+            lines.push(
+              '正文' + i +
+              '：' + shortClass(el) +
+              '；文本=' + (
+                el.innerText || el.textContent || ''
+              ).replace(/\s+/g, ' ').slice(0, 120)
+            );
+          });
+        }
 
-      images.forEach((img, i) => {
-        lines.push(
-          '图片' + (i + 1) +
-          ' alt=' + (img.alt || '(无)') +
-          ' src=' + (img.getAttribute('src') || '(无)').slice(0, 100)
-        );
-      });
-
-      const prose = row.querySelectorAll('.prose');
-
-      prose.forEach((el, i) => {
-        lines.push(
-          '正文' + (i + 1) +
-          ' class=' + el.className +
-          ' text=' + (el.innerText || '').slice(0, 150)
-        );
-      });
-
-      lines.push('子元素结构：');
-
-      Array.from(row.children).forEach((child, i) => {
-        lines.push(
-          '子元素' + i + '：' +
-          child.tagName.toLowerCase() +
-          ' .' +
-          (typeof child.className === 'string'
-            ? child.className.replace(/\s+/g, '.')
-            : '')
-        );
-      });
+        node = node.parentElement;
+      }
 
       lines.push('');
     });
