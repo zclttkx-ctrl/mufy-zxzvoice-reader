@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.2.0
-// @description  Mufy AI角色对白自动朗读与消息识别诊断
+// @version      1.3.0
+// @description  Mufy AI角色对白自动朗读
 // @match        https://chat.mufy.ai/*
 // @run-at       document-idle
 // @grant        none
@@ -12,7 +12,6 @@
 (() => {
   'use strict';
 
-  // AI消息容器：官方类名 + Mufy备用结构
   const AI_SELECTOR = [
     '.mufy_ai_message_bubble',
     '.relative.inline-block[class*="bg-[#711B3F]"]',
@@ -20,27 +19,18 @@
     '[class*="message-outgoing"]'
   ].join(',');
 
-  // 只朗读明确标记的角色对白
-  const DIALOGUE_SELECTOR = '.dialogue';
-
-  // 排除用户消息及不应朗读的区域
   const USER_SELECTOR = [
     '.mufy_user_message_bubble',
     '.relative.inline-block[class*="bg-[#e8bec3]"]',
     '[class*="message-incoming"]'
   ].join(',');
 
-  const IGNORE_SELECTOR = [
-    '.mufy_message_narration',
-    '.mufy_code_block',
-    'details'
-  ].join(',');
-
+  const START_MARK = '【语音开始】';
+  const END_MARK = '【语音结束】';
   const WAIT_TIME = 1800;
 
   let enabled = true;
   let speaking = false;
-  let unlocked = false;
   let queue = [];
   let totalCaught = 0;
 
@@ -59,23 +49,20 @@
   function findContainers(node) {
     if (!(node instanceof Element)) return [];
 
-    const candidates = [];
+    const found = [];
 
-    if (node.matches(AI_SELECTOR)) {
-      candidates.push(node);
-    }
+    if (node.matches(AI_SELECTOR)) found.push(node);
 
     node.querySelectorAll(AI_SELECTOR).forEach(el => {
-      candidates.push(el);
+      found.push(el);
     });
 
     const parent = node.closest(AI_SELECTOR);
-    if (parent) candidates.push(parent);
+    if (parent) found.push(parent);
 
-    const unique = [...new Set(candidates)]
+    const unique = [...new Set(found)]
       .filter(el => !isUserMessage(el));
 
-    // 避免同一条消息的内外容器重复处理
     return unique.filter(el =>
       !unique.some(other =>
         other !== el && other.contains(el)
@@ -83,22 +70,41 @@
     );
   }
 
+  // 只提取明确标记的对白
   function getDialogues(bubble) {
-    return [...bubble.querySelectorAll(DIALOGUE_SELECTOR)]
-      .filter(el => !el.closest(IGNORE_SELECTOR))
-      .map(el =>
-        (el.innerText || el.textContent || '')
-          .replace(/\s+/g, ' ')
-          .trim()
-      )
-      .filter(Boolean);
+    const content = bubble.innerText || '';
+    const result = [];
+
+    let position = 0;
+
+    while (true) {
+      const start = content.indexOf(START_MARK, position);
+      if (start === -1) break;
+
+      const contentStart = start + START_MARK.length;
+      const end = content.indexOf(END_MARK, contentStart);
+
+      // 没有结束标记，说明对白可能还在生成
+      if (end === -1) break;
+
+      const line = content
+        .slice(contentStart, end)
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (line) result.push(line);
+
+      position = end + END_MARK.length;
+    }
+
+    return result;
   }
 
   function playNext() {
     if (!enabled || speaking || !queue.length) return;
 
     if (!('speechSynthesis' in window)) {
-      status('当前浏览器不支持语音');
+      status('浏览器不支持语音');
       return;
     }
 
@@ -143,7 +149,7 @@
       const lines = getDialogues(bubble);
 
       if (!lines.length) {
-        status('已发现AI消息，但没有找到 .dialogue 标签');
+        status('发现AI消息，等待语音标记');
         return;
       }
 
@@ -165,7 +171,7 @@
       totalCaught += fresh.length;
       queue.push(...fresh);
 
-      status('已抓到对白 ' + totalCaught + ' 条，准备朗读');
+      status('已抓到对白 ' + totalCaught + ' 条');
       playNext();
 
     }, WAIT_TIME);
@@ -175,13 +181,12 @@
 
   function scan(node) {
     if (!(node instanceof Element)) return;
-
     findContainers(node).forEach(inspect);
   }
 
   function testVoice() {
     if (!('speechSynthesis' in window)) {
-      status('此浏览器不支持语音');
+      status('浏览器不支持语音');
       return;
     }
 
@@ -189,17 +194,15 @@
     speaking = false;
 
     const test = new SpeechSynthesisUtterance(
-      '语音测试成功。老婆，现在可以听见我的声音了吗？'
+      '语音测试成功。老婆，听见我的声音了吗？'
     );
 
     test.lang = 'zh-CN';
     test.rate = 1;
-    test.pitch = 1;
 
     status('正在测试声音…');
 
     test.onend = () => {
-      unlocked = true;
       status('测试完成 · 监听中');
       playNext();
     };
@@ -215,8 +218,8 @@
     if (document.querySelector('#zxz-voice-panel')) return;
 
     const panel = document.createElement('div');
-    panel.id = 'zxz-voice-panel';
 
+    panel.id = 'zxz-voice-panel';
     panel.style.cssText = `
       position:fixed;
       right:10px;
@@ -236,17 +239,13 @@
 
     const label = document.createElement('div');
     label.id = 'zxz-voice-status';
-    label.textContent = '监听已启动 · 等待角色对白';
-    label.style.cssText =
-      'max-width:210px;word-break:break-word;line-height:1.5';
+    label.textContent = '1.3已启动 · 等待角色对白';
 
     const buttons = document.createElement('div');
-    buttons.style.cssText =
-      'display:flex;gap:6px;flex-wrap:wrap';
+    buttons.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
 
     function makeButton(text) {
       const button = document.createElement('button');
-
       button.textContent = text;
       button.style.cssText = `
         border:0;
@@ -256,7 +255,6 @@
         background:#7650a8;
         font:12px -apple-system,sans-serif;
       `;
-
       return button;
     }
 
@@ -269,11 +267,7 @@
 
       if (!enabled) {
         queue = [];
-
-        if ('speechSynthesis' in window) {
-          speechSynthesis.cancel();
-        }
-
+        speechSynthesis.cancel();
         speaking = false;
         toggle.textContent = '开启';
         status('朗读已暂停');
@@ -288,11 +282,7 @@
 
     clear.onclick = () => {
       queue = [];
-
-      if ('speechSynthesis' in window) {
-        speechSynthesis.cancel();
-      }
-
+      speechSynthesis.cancel();
       speaking = false;
       status('播放队列已清空');
     };
@@ -305,12 +295,9 @@
   function start() {
     createPanel();
 
-    // 不朗读打开页面前已经存在的历史消息
-    const existing = findContainers(document.body);
-    existing.forEach(bubble => {
-      // 仅记录已有对白，避免刷新页面后重复朗读
-      const known = new Set(getDialogues(bubble));
-      seenLines.set(bubble, known);
+    // 不朗读页面打开前已有的历史对白
+    findContainers(document.body).forEach(bubble => {
+      seenLines.set(bubble, new Set(getDialogues(bubble)));
     });
 
     const observer = new MutationObserver(records => {
@@ -324,8 +311,9 @@
         }
 
         if (record.type === 'characterData') {
-          const parent = record.target.parentElement;
-          if (parent) scan(parent);
+          if (record.target.parentElement) {
+            scan(record.target.parentElement);
+          }
         }
 
         if (record.type === 'attributes') {
@@ -342,7 +330,7 @@
       attributeFilter: ['class']
     });
 
-    status('1.2已启动 · 等待角色对白');
+    status('1.3已启动 · 等待角色对白');
   }
 
   if (document.readyState === 'loading') {
