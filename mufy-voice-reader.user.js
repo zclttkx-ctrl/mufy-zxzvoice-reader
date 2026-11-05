@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.5.6
-// @description  Mufy AI-only incremental voice reader
+// @version      1.5.7
+// @description  Mufy message structure diagnostic
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -11,123 +11,47 @@
 (function () {
   'use strict';
 
-  const START = '【语音开始】';
-  const END = '【语音结束】';
-
   const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
-  const GROUP_SELECTOR = '.group';
-  const GREETING_SELECTOR = '.greeting-content';
-
-  let enabled = false;
-  let unlocked = false;
-  let isSpeaking = false;
-  let scanTimer = null;
-
-  const spoken = new Set();
-  const queue = [];
-  const messageStates = new WeakMap();
-  const observedRoots = new WeakSet();
-
-  // ---------- UI ----------
 
   const oldPanel = document.getElementById('zxz-voice-panel');
   if (oldPanel) oldPanel.remove();
 
   const panel = document.createElement('div');
-
   panel.id = 'zxz-voice-panel';
 
   panel.innerHTML = `
-    <div class="zxz-title">
-      ZXZ VOICE READER <span>1.5.6</span>
+    <div style="font-weight:bold;color:#f0c5ce;margin-bottom:7px">
+      ZXZ VOICE READER 1.5.7
     </div>
-    <div id="zxz-status">正在启动监听…</div>
-    <div class="zxz-buttons">
-      <button id="zxz-enable">开启朗读</button>
-      <button id="zxz-test">试听</button>
-      <button id="zxz-check">检查页面</button>
+    <div id="zxz-status" style="font-size:11px;line-height:1.6;overflow-wrap:anywhere">
+      正在检查页面…
     </div>
-    <button id="zxz-stop">停止朗读</button>
+    <button id="zxz-check" style="margin-top:8px;padding:7px;background:#713847;color:white;border:0;border-radius:5px">
+      检查页面
+    </button>
   `;
 
-  const style = document.createElement('style');
+  Object.assign(panel.style, {
+    position: 'fixed',
+    zIndex: '2147483647',
+    right: '10px',
+    bottom: '110px',
+    width: '270px',
+    maxHeight: '45vh',
+    overflow: 'auto',
+    padding: '10px',
+    boxSizing: 'border-box',
+    border: '1px solid #555',
+    borderRadius: '10px',
+    background: 'rgba(25,25,29,.97)',
+    color: 'white',
+    font: '11px -apple-system,BlinkMacSystemFont,sans-serif',
+    boxShadow: '0 4px 16px #0005'
+  });
 
-  style.textContent = `
-    #zxz-voice-panel {
-      position:fixed;
-      z-index:2147483647;
-      right:10px;
-      bottom:110px;
-      width:230px;
-      padding:9px;
-      box-sizing:border-box;
-      border:1px solid #555;
-      border-radius:10px;
-      background:rgba(25,25,29,.97);
-      color:white;
-      font:11px -apple-system,BlinkMacSystemFont,sans-serif;
-      box-shadow:0 4px 16px #0005;
-    }
-
-    #zxz-voice-panel .zxz-title {
-      color:#f0c5ce;
-      font-weight:bold;
-      font-size:10px;
-      letter-spacing:.5px;
-    }
-
-    #zxz-voice-panel .zxz-title span {
-      float:right;
-      color:#999;
-      font-weight:normal;
-    }
-
-    #zxz-status {
-      min-height:42px;
-      padding:7px 0;
-      line-height:1.5;
-      color:#ddd;
-      overflow-wrap:anywhere;
-      font-size:10px;
-    }
-
-    #zxz-voice-panel .zxz-buttons {
-      display:flex;
-      gap:4px;
-    }
-
-    #zxz-voice-panel button {
-      border:0;
-      border-radius:5px;
-      padding:7px 3px;
-      color:white;
-      background:#713847;
-      font-size:9px;
-      line-height:1.2;
-    }
-
-    #zxz-voice-panel .zxz-buttons button {
-      flex:1;
-      min-width:0;
-    }
-
-    #zxz-stop {
-      width:100%;
-      margin-top:5px;
-      background:#444 !important;
-    }
-  `;
-
-  document.documentElement.append(style, panel);
+  document.documentElement.appendChild(panel);
 
   const status = panel.querySelector('#zxz-status');
-  const enableButton = panel.querySelector('#zxz-enable');
-
-  function setStatus(message) {
-    status.textContent = message;
-  }
-
-  // ---------- 页面根节点 ----------
 
   function collectRoots() {
     const roots = [];
@@ -148,15 +72,11 @@
       }
 
       for (const el of elements) {
-        if (el.shadowRoot) {
-          walk(el.shadowRoot);
-        }
+        if (el.shadowRoot) walk(el.shadowRoot);
 
         if (el.tagName === 'IFRAME') {
           try {
-            if (el.contentDocument) {
-              walk(el.contentDocument);
-            }
+            if (el.contentDocument) walk(el.contentDocument);
           } catch (_) {}
         }
       }
@@ -166,84 +86,40 @@
     return roots;
   }
 
-  function isPanelMutation(mutation) {
-    let target = mutation.target;
-
-    if (target && target.nodeType === Node.TEXT_NODE) {
-      target = target.parentElement;
+  function describeNode(node, level) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+      return level + '层：非元素节点';
     }
 
-    return !!(
-      target &&
-      (target === panel || panel.contains(target))
-    );
-  }
+    const tag = node.tagName.toLowerCase();
 
-  function observeRoots(roots) {
-    for (const root of roots) {
-      if (observedRoots.has(root)) continue;
+    let cls = '';
 
-      try {
-        const observer = new MutationObserver(mutations => {
-          if (mutations.some(m => !isPanelMutation(m))) {
-            scheduleScan();
-          }
-        });
-
-        observer.observe(root, {
-          childList: true,
-          subtree: true,
-          characterData: true
-        });
-
-        observedRoots.add(root);
-      } catch (_) {}
-    }
-  }
-
-  // ---------- 正文提取 ----------
-
-  function getCleanText(element) {
-    if (!element) return '';
-
-    const clone = element.cloneNode(true);
-
-    const excluded = [
-      'button',
-      'svg',
-      'script',
-      'style',
-      'input',
-      'textarea',
-      'details',
-      '.mufy_message_narration',
-      '.mufy_code_block',
-      '#mufy_author_note',
-      '#mufy_chat_input_container'
-    ];
-
-    for (const selector of excluded) {
-      try {
-        clone.querySelectorAll(selector).forEach(el => el.remove());
-      } catch (_) {}
+    if (typeof node.className === 'string') {
+      cls = node.className;
+    } else if (node.className && node.className.baseVal) {
+      cls = node.className.baseVal;
     }
 
-    return (clone.textContent || '').replace(/\u00a0/g, ' ');
+    cls = cls.trim().replace(/\s+/g, ' ');
+
+    if (cls.length > 115) {
+      cls = cls.slice(0, 115) + '…';
+    }
+
+    const id = node.id ? '#' + node.id : '';
+    const classText = cls
+      ? ' .' + cls.replace(/ /g, '.')
+      : '';
+
+    return level + '层：' + tag + id + classText;
   }
 
-  function normalizeDialogue(text) {
-    return text.replace(/\s+/g, ' ').trim();
-  }
+  function diagnostic() {
+    const roots = collectRoots();
 
-  // ---------- 消息识别 ----------
-
-  function findMessageRows(roots) {
-    const aiRows = new Set();
-    const userRows = new Set();
-    const unknownRows = new Set();
-
-    let actionButtons = 0;
-    let matchedGroups = 0;
+    const lines = [];
+    let buttonCount = 0;
 
     for (const root of roots) {
       let buttons = [];
@@ -254,413 +130,36 @@
         continue;
       }
 
-      actionButtons += buttons.length;
-
       for (const button of buttons) {
-        const row = button.closest(GROUP_SELECTOR);
+        buttonCount++;
 
-        if (!row) continue;
+        lines.push('按钮 ' + buttonCount);
 
-        matchedGroups++;
+        let node = button;
 
-        // 不再要求消息必须位于 .scroll-primary 内
-
-        const classes = row.classList;
-
-        // 用户消息：反向布局
-        if (classes.contains('flex-row-reverse')) {
-          userRows.add(row);
-          continue;
+        for (let level = 0; level < 9 && node; level++) {
+          lines.push(describeNode(node, level));
+          node = node.parentElement;
         }
 
-        // AI 消息：正向布局
-        if (classes.contains('flex-row')) {
-          aiRows.add(row);
-          continue;
-        }
-
-        // 暂时无法判断的消息，留给诊断
-        unknownRows.add(row);
+        lines.push('----------');
       }
     }
 
-    return {
-      aiRows: Array.from(aiRows),
-      userRows: Array.from(userRows),
-      unknownRows: Array.from(unknownRows),
-      actionButtons,
-      matchedGroups
-    };
-  }
-
-  function findGreetings(roots) {
-    const greetings = new Set();
-
-    for (const root of roots) {
-      try {
-        root.querySelectorAll(GREETING_SELECTOR).forEach(el => {
-          if (!el.closest(GROUP_SELECTOR)) {
-            greetings.add(el);
-          }
-        });
-      } catch (_) {}
-    }
-
-    return Array.from(greetings);
-  }
-
-  // ---------- 对白提取 ----------
-
-  function extractIncremental(text, initialCursor) {
-    const dialogues = [];
-
-    let cursor = Math.max(0, initialCursor || 0);
-    let lastCompleteEnd = cursor;
-
-    while (cursor < text.length) {
-      const start = text.indexOf(START, cursor);
-
-      if (start === -1) {
-        return {
-          dialogues,
-          cursor: Math.max(
-            lastCompleteEnd,
-            text.length - START.length + 1
-          )
-        };
-      }
-
-      const contentStart = start + START.length;
-      const end = text.indexOf(END, contentStart);
-
-      if (end === -1) {
-        return {
-          dialogues,
-          cursor: start
-        };
-      }
-
-      const dialogue = normalizeDialogue(
-        text.slice(contentStart, end)
-      );
-
-      if (dialogue) {
-        dialogues.push(dialogue);
-      }
-
-      cursor = end + END.length;
-      lastCompleteEnd = cursor;
-    }
-
-    return {
-      dialogues,
-      cursor: Math.max(
-        lastCompleteEnd,
-        text.length - START.length + 1
-      )
-    };
-  }
-
-  function fingerprint(dialogue) {
-    return normalizeDialogue(dialogue);
-  }
-
-  function enqueue(dialogue) {
-    if (!dialogue) return false;
-
-    const key = fingerprint(dialogue);
-
-    if (spoken.has(key)) return false;
-
-    spoken.add(key);
-    queue.push(dialogue);
-
-    return true;
-  }
-
-  function processContainer(element, baseline) {
-    const text = getCleanText(element);
-
-    let state = messageStates.get(element);
-
-    if (!state) {
-      state = {
-        snapshot: '',
-        cursor: 0
-      };
-
-      messageStates.set(element, state);
-    }
-
-    if (state.snapshot === text) return 0;
-
-    const startCursor = text.startsWith(state.snapshot)
-      ? state.cursor
-      : 0;
-
-    const result = extractIncremental(text, startCursor);
-
-    state.snapshot = text;
-    state.cursor = result.cursor;
-
-    let added = 0;
-
-    for (const dialogue of result.dialogues) {
-      if (baseline) {
-        spoken.add(fingerprint(dialogue));
-      } else if (enabled && unlocked) {
-        if (enqueue(dialogue)) added++;
-      }
-    }
-
-    return added;
-  }
-
-  // ---------- 语音队列 ----------
-
-  function pumpQueue() {
-    if (!enabled || !unlocked || isSpeaking) return;
-
-    if (!queue.length) {
-      setStatus('朗读完成，继续监听 AI 新对白…');
+    if (!buttonCount) {
+      status.textContent = '没有找到操作按钮。';
       return;
     }
 
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音合成');
-      return;
-    }
-
-    const text = queue.shift();
-
-    isSpeaking = true;
-
-    const utterance = new SpeechSynthesisUtterance(text);
-
-    utterance.lang = 'zh-CN';
-    utterance.rate = 1;
-    utterance.pitch = 1;
-
-    try {
-      const voices = speechSynthesis.getVoices();
-
-      const voice = voices.find(v =>
-        v.lang && v.lang.toLowerCase().startsWith('zh')
-      );
-
-      if (voice) utterance.voice = voice;
-    } catch (_) {}
-
-    utterance.onstart = () => {
-      setStatus('正在朗读：' + text);
-    };
-
-    utterance.onend = () => {
-      isSpeaking = false;
-      setTimeout(pumpQueue, 150);
-    };
-
-    utterance.onerror = event => {
-      isSpeaking = false;
-
-      if (enabled) {
-        setStatus('语音错误：' + event.error);
-        setTimeout(pumpQueue, 300);
-      }
-    };
-
-    try {
-      speechSynthesis.speak(utterance);
-    } catch (_) {
-      isSpeaking = false;
-      setStatus('播放失败，请重新开启朗读');
-    }
+    status.textContent =
+      '找到操作按钮：' + buttonCount +
+      '。以下是每个按钮向上的九层结构：\n\n' +
+      lines.join('\n');
   }
-
-  // ---------- 扫描 ----------
-
-  function scan() {
-    const roots = collectRoots();
-    observeRoots(roots);
-
-    const result = findMessageRows(roots);
-    const greetings = findGreetings(roots);
-
-    let added = 0;
-
-    for (const row of result.aiRows) {
-      added += processContainer(row, false);
-    }
-
-    for (const greeting of greetings) {
-      added += processContainer(greeting, false);
-    }
-
-    if (!enabled || !unlocked) {
-      setStatus(
-        '操作按钮：' + result.actionButtons +
-        '；消息组：' + result.matchedGroups +
-        '；AI：' + result.aiRows.length +
-        '；用户：' + result.userRows.length +
-        '；待判断：' + result.unknownRows.length +
-        '；开场白：' + greetings.length
-      );
-
-      return;
-    }
-
-    if (added > 0) {
-      setStatus('发现 AI 新对白，加入队列 ' + added + ' 条');
-      pumpQueue();
-    }
-  }
-
-  function scheduleScan() {
-    clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 250);
-  }
-
-  // ---------- 历史消息登记 ----------
-
-  function baselineExistingMessages() {
-    const roots = collectRoots();
-    observeRoots(roots);
-
-    const result = findMessageRows(roots);
-    const greetings = findGreetings(roots);
-
-    for (const row of result.aiRows) {
-      processContainer(row, true);
-    }
-
-    for (const greeting of greetings) {
-      processContainer(greeting, true);
-    }
-
-    return result;
-  }
-
-  // ---------- 详细诊断 ----------
-
-  function diagnostic() {
-    const roots = collectRoots();
-    const result = findMessageRows(roots);
-    const greetings = findGreetings(roots);
-
-    let dialogueCount = 0;
-
-    for (const row of result.aiRows) {
-      dialogueCount += extractIncremental(
-        getCleanText(row),
-        0
-      ).dialogues.length;
-    }
-
-    for (const greeting of greetings) {
-      dialogueCount += extractIncremental(
-        getCleanText(greeting),
-        0
-      ).dialogues.length;
-    }
-
-    const examples = result.unknownRows
-      .slice(0, 2)
-      .map(row => row.className || '(无 class)')
-      .join(' / ');
-
-    setStatus(
-      '操作按钮：' + result.actionButtons +
-      '；消息组：' + result.matchedGroups +
-      '；AI：' + result.aiRows.length +
-      '；用户：' + result.userRows.length +
-      '；待判断：' + result.unknownRows.length +
-      '；开场白：' + greetings.length +
-      '；完整对白：' + dialogueCount +
-      '；队列：' + queue.length +
-      (examples ? '；未知布局：' + examples : '')
-    );
-  }
-
-  // ---------- 按钮 ----------
-
-  enableButton.addEventListener('click', () => {
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音合成');
-      return;
-    }
-
-    baselineExistingMessages();
-
-    enabled = true;
-    unlocked = true;
-
-    enableButton.textContent = '朗读已开启';
-
-    speechSynthesis.cancel();
-    isSpeaking = true;
-
-    const unlock = new SpeechSynthesisUtterance(
-      '语音朗读已开启'
-    );
-
-    unlock.lang = 'zh-CN';
-
-    unlock.onend = () => {
-      isSpeaking = false;
-      setStatus('已开启，只监听 AI 新对白…');
-      scheduleScan();
-      setTimeout(pumpQueue, 150);
-    };
-
-    unlock.onerror = () => {
-      isSpeaking = false;
-      setStatus('已开启，等待角色新对白…');
-      scheduleScan();
-      setTimeout(pumpQueue, 150);
-    };
-
-    try {
-      speechSynthesis.speak(unlock);
-    } catch (_) {
-      isSpeaking = false;
-      setStatus('语音启动失败，请再点一次开启朗读');
-    }
-  });
-
-  panel.querySelector('#zxz-test')
-    .addEventListener('click', () => {
-      if (!enabled || !unlocked) {
-        setStatus('请先开启朗读');
-        return;
-      }
-
-      queue.push('听见了吗？过来。');
-      pumpQueue();
-    });
 
   panel.querySelector('#zxz-check')
     .addEventListener('click', diagnostic);
 
-  panel.querySelector('#zxz-stop')
-    .addEventListener('click', () => {
-      enabled = false;
-      unlocked = false;
-
-      if ('speechSynthesis' in window) {
-        speechSynthesis.cancel();
-      }
-
-      isSpeaking = false;
-      queue.length = 0;
-
-      enableButton.textContent = '开启朗读';
-      setStatus('朗读已停止');
-    });
-
-  // ---------- 启动 ----------
-
-  const roots = collectRoots();
-  observeRoots(roots);
-  scheduleScan();
+  diagnostic();
 
 })();
