@@ -1,8 +1,7 @@
-
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.6.2
+// @version      1.6.3
 // @description  Mufy AI-only zxznarration voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
@@ -41,7 +40,7 @@
 
   panel.innerHTML = `
     <div class="zxz-title">
-      ZXZ VOICE READER <span>1.6.2</span>
+      ZXZ VOICE READER <span>1.6.3</span>
     </div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
@@ -136,8 +135,10 @@
 
     document.querySelectorAll(ACTION_SELECTOR).forEach(button => {
       const row = button.closest(MESSAGE_SELECTOR);
+
       if (!row) return;
       if (!row.querySelector(ACTION_SELECTOR)) return;
+
       rows.add(row);
     });
 
@@ -165,10 +166,6 @@
     containers.forEach(container => {
       container.querySelectorAll(DIALOGUE_SELECTOR)
         .forEach(element => elements.add(element));
-
-      if (container.matches(DIALOGUE_SELECTOR)) {
-        elements.add(container);
-      }
     });
 
     return Array.from(elements);
@@ -189,9 +186,11 @@
     elements.forEach(element => {
       const text = normalize(element.textContent);
 
-      processed.add(element);
+      // 关键修复：空标签绝不标记为已处理
+      if (!text) return;
 
-      if (text) spoken.add(text);
+      processed.add(element);
+      spoken.add(text);
     });
 
     return elements.length;
@@ -225,23 +224,31 @@
 
     let added = 0;
     let waiting = 0;
+    let empty = 0;
 
     elements.forEach(element => {
       const text = normalize(element.textContent);
 
-      if (!enabled || !unlocked) {
-        processed.add(element);
-        if (text) spoken.add(text);
+      // 空标签不登记、不处理，等待文字填入
+      if (!text) {
+        empty++;
         return;
       }
 
-      if (processed.has(element) || !text) return;
+      if (!enabled || !unlocked) {
+        processed.add(element);
+        spoken.add(text);
+        return;
+      }
+
+      if (processed.has(element)) return;
 
       let state = pending.get(element);
 
+      // 首次发现文字，开始计时
       if (!state || state.text !== text) {
         pending.set(element, {
-          text,
+          text: text,
           changedAt: Date.now()
         });
 
@@ -249,15 +256,19 @@
         return;
       }
 
+      // 文字尚未稳定
       if (Date.now() - state.changedAt < STABLE_DELAY) {
         waiting++;
         return;
       }
 
+      // 文字稳定，加入朗读队列
       processed.add(element);
       pending.delete(element);
 
-      if (enqueue(text)) added++;
+      if (enqueue(text)) {
+        added++;
+      }
     });
 
     if (!enabled || !unlocked) {
@@ -274,6 +285,10 @@
       pumpQueue();
     } else if (waiting > 0) {
       setStatus('正在等待对白生成完成…');
+    } else if (empty > 0) {
+      setStatus('发现空对白标签，等待文字填入…');
+    } else {
+      setStatus('朗读完成，继续监听 AI 新对白…');
     }
   }
 
@@ -356,22 +371,20 @@
   function diagnostic() {
     const aiMessages = findAIMessages();
     const greetings = findGreetings();
+    const elements = findDialogueElements();
 
-    const elements = new Set();
+    const nonEmpty = elements.filter(
+      element => normalize(element.textContent)
+    ).length;
 
-    [...aiMessages, ...greetings].forEach(container => {
-      container.querySelectorAll(DIALOGUE_SELECTOR)
-        .forEach(element => elements.add(element));
-    });
-
-    const count = Array.from(elements)
-      .filter(element => normalize(element.textContent))
-      .length;
+    const empty = elements.length - nonEmpty;
 
     setStatus(
       'AI 消息：' + aiMessages.length +
       '；开场白：' + greetings.length +
-      '；对白标签：' + count +
+      '；对白标签：' + elements.length +
+      '；有文字：' + nonEmpty +
+      '；空标签：' + empty +
       '；队列：' + queue.length
     );
   }
@@ -453,8 +466,15 @@
 
   // ---------- 自动监听 ----------
 
-  const observer = new MutationObserver(() => {
-    scheduleScan();
+  const observer = new MutationObserver(mutations => {
+    const relevant = mutations.some(mutation => {
+      return !(
+        mutation.target === panel ||
+        panel.contains(mutation.target)
+      );
+    });
+
+    if (relevant) scheduleScan();
   });
 
   observer.observe(document.documentElement, {
