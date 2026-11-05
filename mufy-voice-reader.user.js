@@ -1,8 +1,9 @@
+
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.6.1
-// @description  Mufy AI-only narration-class voice reader
+// @version      1.6.2
+// @description  Mufy AI-only zxznarration voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -17,6 +18,7 @@
   const GREETING_SELECTOR = '.greeting-content';
 
   const STABLE_DELAY = 1200;
+  const SCAN_INTERVAL = 350;
 
   let enabled = false;
   let unlocked = false;
@@ -26,10 +28,7 @@
   const spoken = new Set();
   const queue = [];
 
-  // 已处理的对白标签
   const processed = new WeakSet();
-
-  // 正在等待文字稳定的对白
   const pending = new WeakMap();
 
   // ---------- UI ----------
@@ -42,7 +41,7 @@
 
   panel.innerHTML = `
     <div class="zxz-title">
-      ZXZ VOICE READER <span>1.6.1</span>
+      ZXZ VOICE READER <span>1.6.2</span>
     </div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
@@ -137,11 +136,8 @@
 
     document.querySelectorAll(ACTION_SELECTOR).forEach(button => {
       const row = button.closest(MESSAGE_SELECTOR);
-
       if (!row) return;
-
       if (!row.querySelector(ACTION_SELECTOR)) return;
-
       rows.add(row);
     });
 
@@ -156,7 +152,7 @@
     );
   }
 
-  // ---------- 获取对白标签 ----------
+  // ---------- 找到对白标签 ----------
 
   function findDialogueElements() {
     const containers = [
@@ -185,7 +181,7 @@
       .trim();
   }
 
-  // ---------- 历史对白登记 ----------
+  // ---------- 登记历史对白 ----------
 
   function baselineExistingMessages() {
     const elements = findDialogueElements();
@@ -201,7 +197,7 @@
     return elements.length;
   }
 
-  // ---------- 语音队列 ----------
+  // ---------- 加入队列 ----------
 
   function enqueue(dialogue) {
     const text = normalize(dialogue);
@@ -235,22 +231,17 @@
 
       if (!enabled || !unlocked) {
         processed.add(element);
-
         if (text) spoken.add(text);
-
         return;
       }
 
-      if (processed.has(element)) return;
-
-      if (!text) return;
+      if (processed.has(element) || !text) return;
 
       let state = pending.get(element);
 
-      // 第一次发现，开始等待文字稳定
       if (!state || state.text !== text) {
         pending.set(element, {
-          text: text,
+          text,
           changedAt: Date.now()
         });
 
@@ -258,19 +249,15 @@
         return;
       }
 
-      // 文字还在生成，继续等待
       if (Date.now() - state.changedAt < STABLE_DELAY) {
         waiting++;
         return;
       }
 
-      // 文字稳定，正式加入朗读队列
       processed.add(element);
       pending.delete(element);
 
-      if (enqueue(text)) {
-        added++;
-      }
+      if (enqueue(text)) added++;
     });
 
     if (!enabled || !unlocked) {
@@ -279,7 +266,6 @@
         '；对白标签：' + elements.size +
         '；等待开启朗读'
       );
-
       return;
     }
 
@@ -291,9 +277,18 @@
     }
   }
 
+  // ---------- 持续扫描 ----------
+
   function scheduleScan() {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 250);
+
+    scanTimer = setTimeout(() => {
+      scan();
+
+      if (enabled && unlocked) {
+        scheduleScan();
+      }
+    }, SCAN_INTERVAL);
   }
 
   // ---------- 语音播放 ----------
@@ -312,7 +307,6 @@
     }
 
     const text = queue.shift();
-
     isSpeaking = true;
 
     const utterance = new SpeechSynthesisUtterance(text);
@@ -370,14 +364,14 @@
         .forEach(element => elements.add(element));
     });
 
-    const completeCount = Array.from(elements)
+    const count = Array.from(elements)
       .filter(element => normalize(element.textContent))
       .length;
 
     setStatus(
       'AI 消息：' + aiMessages.length +
       '；开场白：' + greetings.length +
-      '；对白标签：' + completeCount +
+      '；对白标签：' + count +
       '；队列：' + queue.length
     );
   }
@@ -447,6 +441,7 @@
       enabled = false;
       unlocked = false;
 
+      clearTimeout(scanTimer);
       speechSynthesis.cancel();
 
       isSpeaking = false;
