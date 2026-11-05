@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.6.0
-// @description  Mufy AI-only incremental voice reader
+// @version      1.6.1
+// @description  Mufy AI-only narration-class voice reader
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -11,13 +11,12 @@
 (function () {
   'use strict';
 
-  const START = '【语音开始】';
-  const END = '【语音结束】';
-
-  // 根据实际页面结构：操作按钮向上第5层
+  const DIALOGUE_SELECTOR = '.zxznarration';
   const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
   const MESSAGE_SELECTOR = 'div.flex.min-w-0.flex-1.flex-col';
   const GREETING_SELECTOR = '.greeting-content';
+
+  const STABLE_DELAY = 1200;
 
   let enabled = false;
   let unlocked = false;
@@ -26,7 +25,12 @@
 
   const spoken = new Set();
   const queue = [];
-  const messageStates = new WeakMap();
+
+  // 已处理的对白标签
+  const processed = new WeakSet();
+
+  // 正在等待文字稳定的对白
+  const pending = new WeakMap();
 
   // ---------- UI ----------
 
@@ -38,7 +42,7 @@
 
   panel.innerHTML = `
     <div class="zxz-title">
-      ZXZ VOICE READER <span>1.6.0</span>
+      ZXZ VOICE READER <span>1.6.1</span>
     </div>
     <div id="zxz-status">正在启动监听…</div>
     <div class="zxz-buttons">
@@ -126,19 +130,16 @@
     status.textContent = message;
   }
 
-  // ---------- 找到真正的 AI 消息 ----------
+  // ---------- 找到 AI 消息 ----------
 
   function findAIMessages() {
     const rows = new Set();
 
     document.querySelectorAll(ACTION_SELECTOR).forEach(button => {
-      // 不再使用 .group
-      // 根据真实 DOM 找到正文和操作栏共同的父容器
       const row = button.closest(MESSAGE_SELECTOR);
 
       if (!row) return;
 
-      // 确认这个容器内部确实有对应的操作按钮
       if (!row.querySelector(ACTION_SELECTOR)) return;
 
       rows.add(row);
@@ -155,145 +156,144 @@
     );
   }
 
-  // ---------- 提取正文 ----------
+  // ---------- 获取对白标签 ----------
 
-  function getCleanText(element) {
-    if (!element) return '';
-
-    const clone = element.cloneNode(true);
-
-    const excluded = [
-      'button',
-      'svg',
-      'script',
-      'style',
-      'input',
-      'textarea',
-      'details',
-      '#mufy_message_actions_box',
-      '.mufy_message_narration',
-      '.mufy_code_block',
-      '#mufy_author_note',
-      '#mufy_chat_input_container'
+  function findDialogueElements() {
+    const containers = [
+      ...findAIMessages(),
+      ...findGreetings()
     ];
 
-    excluded.forEach(selector => {
-      try {
-        clone.querySelectorAll(selector).forEach(el => el.remove());
-      } catch (_) {}
+    const elements = new Set();
+
+    containers.forEach(container => {
+      container.querySelectorAll(DIALOGUE_SELECTOR)
+        .forEach(element => elements.add(element));
+
+      if (container.matches(DIALOGUE_SELECTOR)) {
+        elements.add(container);
+      }
     });
 
-    return (clone.textContent || '')
-      .replace(/\u00a0/g, ' ');
+    return Array.from(elements);
   }
 
   function normalize(text) {
-    return text.replace(/\s+/g, ' ').trim();
+    return (text || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
-  // ---------- 提取完整对白 ----------
+  // ---------- 历史对白登记 ----------
 
-  function extractIncremental(text, initialCursor) {
-    const dialogues = [];
+  function baselineExistingMessages() {
+    const elements = findDialogueElements();
 
-    let cursor = Math.max(0, initialCursor || 0);
-    let lastCompleteEnd = cursor;
+    elements.forEach(element => {
+      const text = normalize(element.textContent);
 
-    while (cursor < text.length) {
-      const start = text.indexOf(START, cursor);
+      processed.add(element);
 
-      if (start === -1) {
-        return {
-          dialogues,
-          cursor: Math.max(
-            lastCompleteEnd,
-            text.length - START.length + 1
-          )
-        };
-      }
+      if (text) spoken.add(text);
+    });
 
-      const contentStart = start + START.length;
-      const end = text.indexOf(END, contentStart);
-
-      if (end === -1) {
-        return {
-          dialogues,
-          cursor: start
-        };
-      }
-
-      const dialogue = normalize(
-        text.slice(contentStart, end)
-      );
-
-      if (dialogue) {
-        dialogues.push(dialogue);
-      }
-
-      cursor = end + END.length;
-      lastCompleteEnd = cursor;
-    }
-
-    return {
-      dialogues,
-      cursor: Math.max(
-        lastCompleteEnd,
-        text.length - START.length + 1
-      )
-    };
+    return elements.length;
   }
 
-  // ---------- 防止重复 ----------
+  // ---------- 语音队列 ----------
 
   function enqueue(dialogue) {
-    const key = normalize(dialogue);
+    const text = normalize(dialogue);
 
-    if (!key || spoken.has(key)) return false;
+    if (!text || spoken.has(text)) return false;
 
-    spoken.add(key);
-    queue.push(key);
+    spoken.add(text);
+    queue.push(text);
 
     return true;
   }
 
-  // ---------- 增量扫描 ----------
+  // ---------- 扫描对白 ----------
 
-  function processContainer(element, baseline) {
-    const text = getCleanText(element);
+  function scan() {
+    const aiMessages = findAIMessages();
+    const greetings = findGreetings();
 
-    let state = messageStates.get(element);
+    const elements = new Set();
 
-    if (!state) {
-      state = {
-        snapshot: '',
-        cursor: 0
-      };
-
-      messageStates.set(element, state);
-    }
-
-    if (state.snapshot === text) return 0;
-
-    const startCursor = text.startsWith(state.snapshot)
-      ? state.cursor
-      : 0;
-
-    const result = extractIncremental(text, startCursor);
-
-    state.snapshot = text;
-    state.cursor = result.cursor;
+    [...aiMessages, ...greetings].forEach(container => {
+      container.querySelectorAll(DIALOGUE_SELECTOR)
+        .forEach(element => elements.add(element));
+    });
 
     let added = 0;
+    let waiting = 0;
 
-    for (const dialogue of result.dialogues) {
-      if (baseline) {
-        spoken.add(normalize(dialogue));
-      } else if (enabled && unlocked) {
-        if (enqueue(dialogue)) added++;
+    elements.forEach(element => {
+      const text = normalize(element.textContent);
+
+      if (!enabled || !unlocked) {
+        processed.add(element);
+
+        if (text) spoken.add(text);
+
+        return;
       }
+
+      if (processed.has(element)) return;
+
+      if (!text) return;
+
+      let state = pending.get(element);
+
+      // 第一次发现，开始等待文字稳定
+      if (!state || state.text !== text) {
+        pending.set(element, {
+          text: text,
+          changedAt: Date.now()
+        });
+
+        waiting++;
+        return;
+      }
+
+      // 文字还在生成，继续等待
+      if (Date.now() - state.changedAt < STABLE_DELAY) {
+        waiting++;
+        return;
+      }
+
+      // 文字稳定，正式加入朗读队列
+      processed.add(element);
+      pending.delete(element);
+
+      if (enqueue(text)) {
+        added++;
+      }
+    });
+
+    if (!enabled || !unlocked) {
+      setStatus(
+        'AI 消息：' + aiMessages.length +
+        '；对白标签：' + elements.size +
+        '；等待开启朗读'
+      );
+
+      return;
     }
 
-    return added;
+    if (added > 0) {
+      setStatus('发现 AI 新对白，加入队列 ' + added + ' 条');
+      pumpQueue();
+    } else if (waiting > 0) {
+      setStatus('正在等待对白生成完成…');
+    }
+  }
+
+  function scheduleScan() {
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(scan, 250);
   }
 
   // ---------- 语音播放 ----------
@@ -357,89 +357,27 @@
     }
   }
 
-  // ---------- 扫描页面 ----------
-
-  function scan() {
-    const aiMessages = findAIMessages();
-    const greetings = findGreetings();
-
-    let added = 0;
-
-    aiMessages.forEach(row => {
-      added += processContainer(row, false);
-    });
-
-    greetings.forEach(row => {
-      added += processContainer(row, false);
-    });
-
-    if (!enabled || !unlocked) {
-      setStatus(
-        'AI 消息：' + aiMessages.length +
-        '；开场白：' + greetings.length +
-        '；等待开启朗读'
-      );
-
-      return;
-    }
-
-    if (added > 0) {
-      setStatus('发现 AI 新对白，加入队列 ' + added + ' 条');
-      pumpQueue();
-    }
-  }
-
-  function scheduleScan() {
-    clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 250);
-  }
-
-  // ---------- 历史对白静默登记 ----------
-
-  function baselineExistingMessages() {
-    const aiMessages = findAIMessages();
-    const greetings = findGreetings();
-
-    aiMessages.forEach(row => {
-      processContainer(row, true);
-    });
-
-    greetings.forEach(row => {
-      processContainer(row, true);
-    });
-
-    return {
-      aiCount: aiMessages.length,
-      greetingCount: greetings.length
-    };
-  }
-
   // ---------- 诊断 ----------
 
   function diagnostic() {
     const aiMessages = findAIMessages();
     const greetings = findGreetings();
 
-    let dialogueCount = 0;
+    const elements = new Set();
 
-    aiMessages.forEach(row => {
-      dialogueCount += extractIncremental(
-        getCleanText(row),
-        0
-      ).dialogues.length;
+    [...aiMessages, ...greetings].forEach(container => {
+      container.querySelectorAll(DIALOGUE_SELECTOR)
+        .forEach(element => elements.add(element));
     });
 
-    greetings.forEach(row => {
-      dialogueCount += extractIncremental(
-        getCleanText(row),
-        0
-      ).dialogues.length;
-    });
+    const completeCount = Array.from(elements)
+      .filter(element => normalize(element.textContent))
+      .length;
 
     setStatus(
       'AI 消息：' + aiMessages.length +
       '；开场白：' + greetings.length +
-      '；完整对白：' + dialogueCount +
+      '；对白标签：' + completeCount +
       '；队列：' + queue.length
     );
   }
@@ -470,7 +408,7 @@
 
     unlock.onend = () => {
       isSpeaking = false;
-      setStatus('已开启，只监听 AI 新对白…');
+      setStatus('已开启，只监听新的对白标签…');
       scheduleScan();
       setTimeout(pumpQueue, 150);
     };
@@ -520,17 +458,8 @@
 
   // ---------- 自动监听 ----------
 
-  const observer = new MutationObserver(mutations => {
-    const relevant = mutations.some(mutation => {
-      const target = mutation.target;
-
-      return !(
-        target === panel ||
-        panel.contains(target)
-      );
-    });
-
-    if (relevant) scheduleScan();
+  const observer = new MutationObserver(() => {
+    scheduleScan();
   });
 
   observer.observe(document.documentElement, {
