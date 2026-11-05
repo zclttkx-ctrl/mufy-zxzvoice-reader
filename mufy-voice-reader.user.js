@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Mufy ZXZ Voice Reader
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.1.0
-// @description  Mufy AI角色对白自动朗读与抓取诊断
+// @version      1.2.0
+// @description  Mufy AI角色对白自动朗读与消息识别诊断
 // @match        https://chat.mufy.ai/*
 // @run-at       document-idle
 // @grant        none
@@ -12,19 +12,38 @@
 (() => {
   'use strict';
 
-  const AI_SELECTOR =
-    '.mufy_ai_message_bubble, [class*="mufy_ai_message"]';
+  // AI消息容器：官方类名 + Mufy备用结构
+  const AI_SELECTOR = [
+    '.mufy_ai_message_bubble',
+    '.relative.inline-block[class*="bg-[#711B3F]"]',
+    '.greeting-content',
+    '[class*="message-outgoing"]'
+  ].join(',');
+
+  // 只朗读明确标记的角色对白
   const DIALOGUE_SELECTOR = '.dialogue';
+
+  // 排除用户消息及不应朗读的区域
+  const USER_SELECTOR = [
+    '.mufy_user_message_bubble',
+    '.relative.inline-block[class*="bg-[#e8bec3]"]',
+    '[class*="message-incoming"]'
+  ].join(',');
+
+  const IGNORE_SELECTOR = [
+    '.mufy_message_narration',
+    '.mufy_code_block',
+    'details'
+  ].join(',');
 
   const WAIT_TIME = 1800;
 
   let enabled = true;
   let speaking = false;
+  let unlocked = false;
   let queue = [];
-  let aiCount = 0;
-  let dialogueCount = 0;
+  let totalCaught = 0;
 
-  const ignored = new WeakSet();
   const timers = new WeakMap();
   const seenLines = new WeakMap();
 
@@ -33,16 +52,45 @@
     if (el) el.textContent = message;
   }
 
-  function getBubble(node) {
-    if (!(node instanceof Element)) return null;
+  function isUserMessage(el) {
+    return !!el.closest(USER_SELECTOR);
+  }
 
-    return node.closest(AI_SELECTOR);
+  function findContainers(node) {
+    if (!(node instanceof Element)) return [];
+
+    const candidates = [];
+
+    if (node.matches(AI_SELECTOR)) {
+      candidates.push(node);
+    }
+
+    node.querySelectorAll(AI_SELECTOR).forEach(el => {
+      candidates.push(el);
+    });
+
+    const parent = node.closest(AI_SELECTOR);
+    if (parent) candidates.push(parent);
+
+    const unique = [...new Set(candidates)]
+      .filter(el => !isUserMessage(el));
+
+    // 避免同一条消息的内外容器重复处理
+    return unique.filter(el =>
+      !unique.some(other =>
+        other !== el && other.contains(el)
+      )
+    );
   }
 
   function getDialogues(bubble) {
     return [...bubble.querySelectorAll(DIALOGUE_SELECTOR)]
-      .map(el => (el.innerText || el.textContent || '')
-        .replace(/\s+/g, ' ').trim())
+      .filter(el => !el.closest(IGNORE_SELECTOR))
+      .map(el =>
+        (el.innerText || el.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+      )
       .filter(Boolean);
   }
 
@@ -50,7 +98,7 @@
     if (!enabled || speaking || !queue.length) return;
 
     if (!('speechSynthesis' in window)) {
-      status('浏览器不支持语音');
+      status('当前浏览器不支持语音');
       return;
     }
 
@@ -62,20 +110,22 @@
     utterance.pitch = 1;
 
     speaking = true;
-    status('正在朗读…');
+    status('正在朗读角色对白…');
 
     utterance.onend = () => {
       speaking = false;
+
       if (queue.length) {
         playNext();
       } else {
-        status('朗读完成 · 监听中');
+        status('朗读完成 · 继续监听');
       }
     };
 
-    utterance.onerror = (event) => {
+    utterance.onerror = event => {
       speaking = false;
-      status('语音错误：' + event.error);
+      status('语音播放错误：' + event.error);
+
       if (queue.length) playNext();
     };
 
@@ -83,21 +133,22 @@
   }
 
   function inspect(bubble) {
-    if (!enabled || !bubble || ignored.has(bubble)) return;
+    if (!enabled || !bubble || !bubble.isConnected) return;
 
     clearTimeout(timers.get(bubble));
 
     const timer = setTimeout(() => {
-      if (!bubble.isConnected || ignored.has(bubble)) return;
+      if (!enabled || !bubble.isConnected) return;
 
       const lines = getDialogues(bubble);
 
       if (!lines.length) {
-        status('发现AI消息，暂未找到对白标签');
+        status('已发现AI消息，但没有找到 .dialogue 标签');
         return;
       }
 
       let known = seenLines.get(bubble);
+
       if (!known) {
         known = new Set();
         seenLines.set(bubble, known);
@@ -111,11 +162,12 @@
 
       if (!fresh.length) return;
 
-      dialogueCount += fresh.length;
-      status('已抓到对白 ' + dialogueCount + ' 条，准备播放');
-
+      totalCaught += fresh.length;
       queue.push(...fresh);
+
+      status('已抓到对白 ' + totalCaught + ' 条，准备朗读');
       playNext();
+
     }, WAIT_TIME);
 
     timers.set(bubble, timer);
@@ -124,18 +176,7 @@
   function scan(node) {
     if (!(node instanceof Element)) return;
 
-    if (node.matches(AI_SELECTOR)) {
-      aiCount++;
-      inspect(node);
-    }
-
-    node.querySelectorAll(AI_SELECTOR).forEach(bubble => {
-      aiCount++;
-      inspect(bubble);
-    });
-
-    const parent = getBubble(node);
-    if (parent) inspect(parent);
+    findContainers(node).forEach(inspect);
   }
 
   function testVoice() {
@@ -148,7 +189,7 @@
     speaking = false;
 
     const test = new SpeechSynthesisUtterance(
-      '语音测试成功。现在可以听见我的声音了吗？'
+      '语音测试成功。老婆，现在可以听见我的声音了吗？'
     );
 
     test.lang = 'zh-CN';
@@ -158,11 +199,12 @@
     status('正在测试声音…');
 
     test.onend = () => {
+      unlocked = true;
       status('测试完成 · 监听中');
       playNext();
     };
 
-    test.onerror = (event) => {
+    test.onerror = event => {
       status('测试失败：' + event.error);
     };
 
@@ -189,13 +231,14 @@
       color:white;
       font:12px -apple-system,sans-serif;
       box-shadow:0 3px 14px #0005;
-      max-width:220px;
+      max-width:230px;
     `;
 
     const label = document.createElement('div');
     label.id = 'zxz-voice-status';
-    label.textContent = '监听中…';
-    label.style.cssText = 'max-width:200px;word-break:break-word';
+    label.textContent = '监听已启动 · 等待角色对白';
+    label.style.cssText =
+      'max-width:210px;word-break:break-word;line-height:1.5';
 
     const buttons = document.createElement('div');
     buttons.style.cssText =
@@ -203,6 +246,7 @@
 
     function makeButton(text) {
       const button = document.createElement('button');
+
       button.textContent = text;
       button.style.cssText = `
         border:0;
@@ -212,6 +256,7 @@
         background:#7650a8;
         font:12px -apple-system,sans-serif;
       `;
+
       return button;
     }
 
@@ -224,13 +269,17 @@
 
       if (!enabled) {
         queue = [];
-        speechSynthesis.cancel();
+
+        if ('speechSynthesis' in window) {
+          speechSynthesis.cancel();
+        }
+
         speaking = false;
         toggle.textContent = '开启';
         status('朗读已暂停');
       } else {
         toggle.textContent = '暂停';
-        status('监听中…');
+        status('监听已恢复');
         playNext();
       }
     };
@@ -239,9 +288,13 @@
 
     clear.onclick = () => {
       queue = [];
-      speechSynthesis.cancel();
+
+      if ('speechSynthesis' in window) {
+        speechSynthesis.cancel();
+      }
+
       speaking = false;
-      status('队列已清空');
+      status('播放队列已清空');
     };
 
     buttons.append(toggle, test, clear);
@@ -252,9 +305,12 @@
   function start() {
     createPanel();
 
-    // 页面初始历史消息不朗读
-    document.querySelectorAll(AI_SELECTOR).forEach(bubble => {
-      ignored.add(bubble);
+    // 不朗读打开页面前已经存在的历史消息
+    const existing = findContainers(document.body);
+    existing.forEach(bubble => {
+      // 仅记录已有对白，避免刷新页面后重复朗读
+      const known = new Set(getDialogues(bubble));
+      seenLines.set(bubble, known);
     });
 
     const observer = new MutationObserver(records => {
@@ -262,14 +318,17 @@
         if (record.type === 'childList') {
           record.addedNodes.forEach(scan);
 
-          const parent = getBubble(record.target);
-          if (parent) inspect(parent);
+          if (record.target instanceof Element) {
+            findContainers(record.target).forEach(inspect);
+          }
+        }
 
-        } else if (record.type === 'characterData') {
-          const parent = getBubble(record.target.parentElement);
-          if (parent) inspect(parent);
+        if (record.type === 'characterData') {
+          const parent = record.target.parentElement;
+          if (parent) scan(parent);
+        }
 
-        } else if (record.type === 'attributes') {
+        if (record.type === 'attributes') {
           scan(record.target);
         }
       }
@@ -283,7 +342,7 @@
       attributeFilter: ['class']
     });
 
-    status('监听已启动 · 等待角色对白');
+    status('1.2已启动 · 等待角色对白');
   }
 
   if (document.readyState === 'loading') {
