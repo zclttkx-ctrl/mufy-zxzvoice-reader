@@ -1,488 +1,282 @@
 // ==UserScript==
-// @name         Mufy ZXZ Voice Reader
+// @name         Mufy ZXZ Voice Reader — Jiang Chaosheng
 // @namespace    https://github.com/zclttkx-ctrl/mufy-zxzvoice-reader
-// @version      1.6.3
-// @description  Mufy AI-only zxznarration voice reader
+// @version      1.6.4
+// @description  Read new Mufy dialogue with your locally saved VocoLoco voice.
 // @match        https://chat.mufy.ai/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-(function () {
+(() => {
   'use strict';
 
+  const VOCO_URL = 'https://zclttkx-ctrl.github.io/vocoloco-mufy/';
+  const VOCO_ORIGIN = 'https://zclttkx-ctrl.github.io';
+  const VOICE_NAME = '姜潮生';
+  const CHANNEL = 'mufy-vocoloco-164';
   const DIALOGUE_SELECTOR = '.zxznarration';
-  const ACTION_SELECTOR = '[id="mufy_message_actions_btn"]';
-  const MESSAGE_SELECTOR = 'div.flex.min-w-0.flex-1.flex-col';
-  const GREETING_SELECTOR = '.greeting-content';
-
   const STABLE_DELAY = 1200;
   const SCAN_INTERVAL = 350;
 
+  let vocWindow = null;
+  let bridgeReady = false;
   let enabled = false;
-  let unlocked = false;
-  let isSpeaking = false;
-  let scanTimer = null;
-
-  const spoken = new Set();
+  let speaking = false;
+  let stopped = false;
+  let requestSeq = 0;
+  let currentSource = null;
+  let audioContext = null;
   const queue = [];
-
-  const processed = new WeakSet();
-  const pending = new WeakMap();
-
-  // ---------- UI ----------
-
-  const oldPanel = document.getElementById('zxz-voice-panel');
-  if (oldPanel) oldPanel.remove();
-
-  const panel = document.createElement('div');
-  panel.id = 'zxz-voice-panel';
-
-  panel.innerHTML = `
-    <div class="zxz-title">
-      ZXZ VOICE READER <span>1.6.3</span>
-    </div>
-    <div id="zxz-status">正在启动监听…</div>
-    <div class="zxz-buttons">
-      <button id="zxz-enable">开启朗读</button>
-      <button id="zxz-test">试听</button>
-      <button id="zxz-check">检查页面</button>
-    </div>
-    <button id="zxz-stop">停止朗读</button>
-  `;
+  const pending = new Map();
+  const seen = new WeakSet();
+  const timers = new WeakMap();
 
   const style = document.createElement('style');
-
   style.textContent = `
-    #zxz-voice-panel {
-      position:fixed;
-      z-index:2147483647;
-      right:10px;
-      bottom:110px;
-      width:230px;
-      padding:9px;
-      box-sizing:border-box;
-      border:1px solid #555;
-      border-radius:10px;
-      background:rgba(25,25,29,.97);
-      color:white;
-      font:11px -apple-system,BlinkMacSystemFont,sans-serif;
-      box-shadow:0 4px 16px #0005;
-    }
-
-    #zxz-voice-panel .zxz-title {
-      color:#f0c5ce;
-      font-weight:bold;
-      font-size:10px;
-      letter-spacing:.5px;
-    }
-
-    #zxz-voice-panel .zxz-title span {
-      float:right;
-      color:#999;
-      font-weight:normal;
-    }
-
-    #zxz-status {
-      min-height:40px;
-      padding:7px 0;
-      line-height:1.5;
-      color:#ddd;
-      overflow-wrap:anywhere;
-      font-size:10px;
-    }
-
-    #zxz-voice-panel .zxz-buttons {
-      display:flex;
-      gap:4px;
-    }
-
-    #zxz-voice-panel button {
-      border:0;
-      border-radius:5px;
-      padding:7px 3px;
-      color:white;
-      background:#713847;
-      font-size:9px;
-      line-height:1.2;
-    }
-
-    #zxz-voice-panel .zxz-buttons button {
-      flex:1;
-      min-width:0;
-    }
-
-    #zxz-stop {
-      width:100%;
-      margin-top:5px;
-      background:#444 !important;
-    }
+    #zxz164-panel{position:fixed;z-index:2147483647;right:14px;bottom:100px;
+      display:flex;gap:7px;align-items:center;font:13px -apple-system,BlinkMacSystemFont,sans-serif}
+    #zxz164-panel button{border:0;border-radius:18px;padding:10px 13px;color:#fff;
+      background:#292929;box-shadow:0 2px 10px #0003}
+    #zxz164-panel button.primary{background:#8b3444}
+    #zxz164-status{max-width:145px;color:#fff;background:#222d;padding:7px 9px;border-radius:12px}
   `;
+  document.documentElement.appendChild(style);
 
-  document.documentElement.append(style, panel);
+  const panel = document.createElement('div');
+  panel.id = 'zxz164-panel';
+  panel.innerHTML = '<button id="zxz164-connect">连接姜潮生</button><button id="zxz164-toggle" class="primary">开启朗读</button><button id="zxz164-stop">停止</button><span id="zxz164-status">未连接</span>';
+  document.body.appendChild(panel);
 
-  const status = panel.querySelector('#zxz-status');
-  const enableButton = panel.querySelector('#zxz-enable');
+  const statusEl = panel.querySelector('#zxz164-status');
+  const toggleEl = panel.querySelector('#zxz164-toggle');
+  const setStatus = (s) => { statusEl.textContent = s; };
 
-  function setStatus(message) {
-    status.textContent = message;
+  function unlockAudio() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error('此浏览器不支持音频播放');
+    if (!audioContext) audioContext = new Ctx({ sampleRate: 24000 });
+    return audioContext.resume();
   }
 
-  // ---------- 找到 AI 消息 ----------
+  function connectVoco() {
+    vocWindow = window.open(VOCO_URL, 'mufyVocoLoco');
+    if (!vocWindow) {
+      setStatus('弹窗被拦截，请允许弹窗');
+      return;
+    }
+    bridgeReady = false;
+    setStatus('正在连接声音页…');
+    pingBridge();
+  }
 
-  function findAIMessages() {
-    const rows = new Set();
+  function pingBridge() {
+    if (!vocWindow || vocWindow.closed) {
+      bridgeReady = false;
+      if (enabled) setStatus('声音页未打开');
+      return;
+    }
+    try {
+      vocWindow.postMessage({
+        channel: CHANNEL,
+        type: 'ping',
+        voice: VOICE_NAME
+      }, VOCO_ORIGIN);
+    } catch {}
+  }
 
-    document.querySelectorAll(ACTION_SELECTOR).forEach(button => {
-      const row = button.closest(MESSAGE_SELECTOR);
+  function requestSpeech(text) {
+    return new Promise((resolve, reject) => {
+      const id = `${Date.now()}-${++requestSeq}`;
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error('语音生成超时，请检查声音页是否仍打开'));
+      }, 300000);
 
-      if (!row) return;
-      if (!row.querySelector(ACTION_SELECTOR)) return;
+      pending.set(id, { resolve, reject, timeout });
 
-      rows.add(row);
+      if (!vocWindow || vocWindow.closed) {
+        clearTimeout(timeout);
+        pending.delete(id);
+        reject(new Error('请先连接并保持 VocoLoco 声音页打开'));
+        return;
+      }
+
+      vocWindow.postMessage({
+        channel: CHANNEL,
+        type: 'synthesize',
+        id,
+        text,
+        voice: VOICE_NAME
+      }, VOCO_ORIGIN);
     });
-
-    return Array.from(rows);
   }
 
-  // ---------- 开场白 ----------
+  function playPCM(pcm, sampleRate) {
+    return new Promise((resolve, reject) => {
+      if (!audioContext) {
+        reject(new Error('请先开启朗读以启用音频'));
+        return;
+      }
 
-  function findGreetings() {
-    return Array.from(
-      document.querySelectorAll(GREETING_SELECTOR)
-    );
-  }
+      const samples = pcm instanceof Float32Array
+        ? pcm
+        : new Float32Array(pcm);
 
-  // ---------- 找到对白标签 ----------
+      if (!samples.length) {
+        reject(new Error('收到的音频为空'));
+        return;
+      }
 
-  function findDialogueElements() {
-    const containers = [
-      ...findAIMessages(),
-      ...findGreetings()
-    ];
+      const buffer = audioContext.createBuffer(
+        1, samples.length, sampleRate || 24000
+      );
 
-    const elements = new Set();
+      buffer.copyToChannel(samples, 0);
 
-    containers.forEach(container => {
-      container.querySelectorAll(DIALOGUE_SELECTOR)
-        .forEach(element => elements.add(element));
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      currentSource = source;
+
+      source.onended = () => {
+        if (currentSource === source) currentSource = null;
+        resolve();
+      };
+
+      source.start();
     });
-
-    return Array.from(elements);
   }
 
-  function normalize(text) {
-    return (text || '')
-      .replace(/\u00a0/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+  async function pumpQueue() {
+    if (speaking || !enabled || !queue.length) return;
+
+    speaking = true;
+    stopped = false;
+    const text = queue.shift();
+
+    try {
+      setStatus('生成语音中…');
+      const result = await requestSpeech(text);
+
+      if (stopped || !enabled) return;
+
+      setStatus('正在朗读');
+      await playPCM(result.pcm, result.sampleRate);
+    } catch (err) {
+      setStatus(err.message || '朗读失败');
+    } finally {
+      speaking = false;
+
+      if (enabled && !stopped) {
+        if (queue.length) {
+          pumpQueue();
+        } else {
+          setStatus(bridgeReady ? '姜潮生已连接 · 待机' : '等待连接');
+        }
+      }
+    }
   }
 
-  // ---------- 登记历史对白 ----------
-
-  function baselineExistingMessages() {
-    const elements = findDialogueElements();
-
-    elements.forEach(element => {
-      const text = normalize(element.textContent);
-
-      // 关键修复：空标签绝不标记为已处理
-      if (!text) return;
-
-      processed.add(element);
-      spoken.add(text);
-    });
-
-    return elements.length;
+  function enqueue(text) {
+    const clean = (text || '').replace(/\s+/g, ' ').trim();
+    if (!clean || clean.length < 2) return;
+    queue.push(clean);
+    pumpQueue();
   }
-
-  // ---------- 加入队列 ----------
-
-  function enqueue(dialogue) {
-    const text = normalize(dialogue);
-
-    if (!text || spoken.has(text)) return false;
-
-    spoken.add(text);
-    queue.push(text);
-
-    return true;
-  }
-
-  // ---------- 扫描对白 ----------
 
   function scan() {
-    const aiMessages = findAIMessages();
-    const greetings = findGreetings();
+    if (!enabled) return;
 
-    const elements = new Set();
+    document.querySelectorAll(DIALOGUE_SELECTOR).forEach((node) => {
+      if (seen.has(node)) return;
 
-    [...aiMessages, ...greetings].forEach(container => {
-      container.querySelectorAll(DIALOGUE_SELECTOR)
-        .forEach(element => elements.add(element));
+      const text = node.innerText || node.textContent || '';
+      if (!text.trim()) return;
+
+      const oldTimer = timers.get(node);
+      if (oldTimer) clearTimeout(oldTimer);
+
+      const timer = setTimeout(() => {
+        if (!node.isConnected || seen.has(node)) return;
+        seen.add(node);
+        enqueue(node.innerText || node.textContent || '');
+      }, STABLE_DELAY);
+
+      timers.set(node, timer);
     });
+  }
 
-    let added = 0;
-    let waiting = 0;
-    let empty = 0;
+  panel.querySelector('#zxz164-connect')
+    .addEventListener('click', connectVoco);
 
-    elements.forEach(element => {
-      const text = normalize(element.textContent);
+  toggleEl.addEventListener('click', async () => {
+    try {
+      await unlockAudio();
+      enabled = !enabled;
+      toggleEl.textContent = enabled ? '暂停朗读' : '开启朗读';
+      setStatus(enabled ? '朗读已开启' : '已暂停');
+      if (enabled) scan();
+    } catch (err) {
+      setStatus(err.message);
+    }
+  });
 
-      // 空标签不登记、不处理，等待文字填入
-      if (!text) {
-        empty++;
-        return;
-      }
+  panel.querySelector('#zxz164-stop').addEventListener('click', () => {
+    stopped = true;
+    queue.length = 0;
 
-      if (!enabled || !unlocked) {
-        processed.add(element);
-        spoken.add(text);
-        return;
-      }
+    try { currentSource?.stop(); } catch {}
+    currentSource = null;
 
-      if (processed.has(element)) return;
+    if (vocWindow && !vocWindow.closed) {
+      vocWindow.postMessage({
+        channel: CHANNEL,
+        type: 'cancel'
+      }, VOCO_ORIGIN);
+    }
 
-      let state = pending.get(element);
+    setStatus('已停止');
+  });
 
-      // 首次发现文字，开始计时
-      if (!state || state.text !== text) {
-        pending.set(element, {
-          text: text,
-          changedAt: Date.now()
-        });
+  window.addEventListener('message', (event) => {
+    if (event.origin !== VOCO_ORIGIN || event.source !== vocWindow) return;
 
-        waiting++;
-        return;
-      }
+    const data = event.data || {};
+    if (data.channel !== CHANNEL) return;
 
-      // 文字尚未稳定
-      if (Date.now() - state.changedAt < STABLE_DELAY) {
-        waiting++;
-        return;
-      }
-
-      // 文字稳定，加入朗读队列
-      processed.add(element);
-      pending.delete(element);
-
-      if (enqueue(text)) {
-        added++;
-      }
-    });
-
-    if (!enabled || !unlocked) {
+    if (data.type === 'pong') {
+      bridgeReady = !!data.ready && !!data.voiceFound;
       setStatus(
-        'AI 消息：' + aiMessages.length +
-        '；对白标签：' + elements.size +
-        '；等待开启朗读'
+        !data.voiceFound
+          ? '未找到姜潮生声音'
+          : (data.ready ? '姜潮生已连接' : '声音页加载中/忙碌')
       );
-      return;
     }
 
-    if (added > 0) {
-      setStatus('发现 AI 新对白，加入队列 ' + added + ' 条');
-      pumpQueue();
-    } else if (waiting > 0) {
-      setStatus('正在等待对白生成完成…');
-    } else if (empty > 0) {
-      setStatus('发现空对白标签，等待文字填入…');
-    } else {
-      setStatus('朗读完成，继续监听 AI 新对白…');
-    }
-  }
+    if (data.type === 'audio') {
+      const item = pending.get(data.id);
+      if (!item) return;
 
-  // ---------- 持续扫描 ----------
-
-  function scheduleScan() {
-    clearTimeout(scanTimer);
-
-    scanTimer = setTimeout(() => {
-      scan();
-
-      if (enabled && unlocked) {
-        scheduleScan();
-      }
-    }, SCAN_INTERVAL);
-  }
-
-  // ---------- 语音播放 ----------
-
-  function pumpQueue() {
-    if (!enabled || !unlocked || isSpeaking) return;
-
-    if (!queue.length) {
-      setStatus('朗读完成，继续监听 AI 新对白…');
-      return;
+      clearTimeout(item.timeout);
+      pending.delete(data.id);
+      item.resolve({
+        pcm: data.pcm,
+        sampleRate: data.sampleRate || 24000
+      });
     }
 
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音合成');
-      return;
-    }
+    if (data.type === 'error') {
+      const item = pending.get(data.id);
+      if (!item) return;
 
-    const text = queue.shift();
-    isSpeaking = true;
-
-    const utterance = new SpeechSynthesisUtterance(text);
-
-    utterance.lang = 'zh-CN';
-    utterance.rate = 1;
-    utterance.pitch = 1;
-
-    try {
-      const voices = speechSynthesis.getVoices();
-
-      const voice = voices.find(v =>
-        v.lang && v.lang.toLowerCase().startsWith('zh')
-      );
-
-      if (voice) utterance.voice = voice;
-    } catch (_) {}
-
-    utterance.onstart = () => {
-      setStatus('正在朗读：' + text);
-    };
-
-    utterance.onend = () => {
-      isSpeaking = false;
-      setTimeout(pumpQueue, 150);
-    };
-
-    utterance.onerror = event => {
-      isSpeaking = false;
-
-      if (enabled) {
-        setStatus('语音错误：' + event.error);
-        setTimeout(pumpQueue, 300);
-      }
-    };
-
-    try {
-      speechSynthesis.speak(utterance);
-    } catch (_) {
-      isSpeaking = false;
-      setStatus('播放失败，请重新开启朗读');
-    }
-  }
-
-  // ---------- 诊断 ----------
-
-  function diagnostic() {
-    const aiMessages = findAIMessages();
-    const greetings = findGreetings();
-    const elements = findDialogueElements();
-
-    const nonEmpty = elements.filter(
-      element => normalize(element.textContent)
-    ).length;
-
-    const empty = elements.length - nonEmpty;
-
-    setStatus(
-      'AI 消息：' + aiMessages.length +
-      '；开场白：' + greetings.length +
-      '；对白标签：' + elements.length +
-      '；有文字：' + nonEmpty +
-      '；空标签：' + empty +
-      '；队列：' + queue.length
-    );
-  }
-
-  // ---------- 按钮 ----------
-
-  enableButton.addEventListener('click', () => {
-    if (!('speechSynthesis' in window)) {
-      setStatus('当前浏览器不支持语音合成');
-      return;
-    }
-
-    baselineExistingMessages();
-
-    enabled = true;
-    unlocked = true;
-
-    enableButton.textContent = '朗读已开启';
-
-    speechSynthesis.cancel();
-    isSpeaking = true;
-
-    const unlock = new SpeechSynthesisUtterance(
-      '语音朗读已开启'
-    );
-
-    unlock.lang = 'zh-CN';
-
-    unlock.onend = () => {
-      isSpeaking = false;
-      setStatus('已开启，只监听新的对白标签…');
-      scheduleScan();
-      setTimeout(pumpQueue, 150);
-    };
-
-    unlock.onerror = () => {
-      isSpeaking = false;
-      setStatus('已开启，等待角色新对白…');
-      scheduleScan();
-      setTimeout(pumpQueue, 150);
-    };
-
-    try {
-      speechSynthesis.speak(unlock);
-    } catch (_) {
-      isSpeaking = false;
-      setStatus('语音启动失败，请再点一次开启朗读');
+      clearTimeout(item.timeout);
+      pending.delete(data.id);
+      item.reject(new Error(data.message || '语音生成失败'));
     }
   });
 
-  panel.querySelector('#zxz-test')
-    .addEventListener('click', () => {
-      if (!enabled || !unlocked) {
-        setStatus('请先开启朗读');
-        return;
-      }
-
-      queue.push('听见了吗？过来。');
-      pumpQueue();
-    });
-
-  panel.querySelector('#zxz-check')
-    .addEventListener('click', diagnostic);
-
-  panel.querySelector('#zxz-stop')
-    .addEventListener('click', () => {
-      enabled = false;
-      unlocked = false;
-
-      clearTimeout(scanTimer);
-      speechSynthesis.cancel();
-
-      isSpeaking = false;
-      queue.length = 0;
-
-      enableButton.textContent = '开启朗读';
-      setStatus('朗读已停止');
-    });
-
-  // ---------- 自动监听 ----------
-
-  const observer = new MutationObserver(mutations => {
-    const relevant = mutations.some(mutation => {
-      return !(
-        mutation.target === panel ||
-        panel.contains(mutation.target)
-      );
-    });
-
-    if (relevant) scheduleScan();
-  });
-
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-    characterData: true
-  });
-
-  scheduleScan();
-
+  setInterval(pingBridge, 2500);
+  setInterval(scan, SCAN_INTERVAL);
+  setStatus('先连接声音页');
 })();
